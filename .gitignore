@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Personal study data. Copy this file directly to move history between machines.
+ultralearn.db
+ultralearn.db-*
+
+.streamlit/secrets.toml
+
+# Frontend
+node_modules/
+desktop/dist/
+desktop/.vite/
+
+# Desktop shell (Tauri, when swapped in)
+desktop/src-tauri/target/
+
+.DS_Store

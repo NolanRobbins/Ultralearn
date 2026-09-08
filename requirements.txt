@@ -1,0 +1,8 @@
+streamlit>=1.40
+pytest>=8.0
+anthropic>=0.34
+openai>=1.40
+pypdf>=5.0
+# Optional: true semantic embeddings for Focus search (needs ~2GB disk for torch).
+# Without it, a dependency-free keyword-vector fallback is used automatically.
+# sentence-transformers>=3.0

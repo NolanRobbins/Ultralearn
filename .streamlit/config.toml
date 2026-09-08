@@ -1,0 +1,25 @@
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+# "Dark mode done right": Streamlit's native theming restyles every widget
+# (sidebar nav, radios, inputs, tables) consistently, so no text is ever
+# dark-on-dark. The CSS in app.py only adds polish on top of this.
+[theme]
+base = "dark"
+primaryColor = "#34d399"
+backgroundColor = "#101418"
+secondaryBackgroundColor = "#1a2026"
+textColor = "#e8eaed"
+linkColor = "#7dd3fc"
+borderColor = "#2c343d"
+baseRadius = "0.6rem"
+font = "sans-serif"
+
+[theme.sidebar]
+backgroundColor = "#161b21"
+secondaryBackgroundColor = "#212932"
+textColor = "#e8eaed"
+borderColor = "#2c343d"
