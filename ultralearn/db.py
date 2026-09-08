@@ -6,7 +6,7 @@ import json
 import re
 import sqlite3
 from contextlib import closing
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -158,11 +158,45 @@ class KnowledgeDB:
                 PRIMARY KEY (kind, ref_id)
             );
 
+            -- Background work. Every provider call is a job so the UI never
+            -- blocks on an LLM; ingestion runs while the learner studies.
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'queued',
+                progress REAL NOT NULL DEFAULT 0.0,
+                detail TEXT NOT NULL DEFAULT '',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- Named misconceptions are first-class: they are re-tested until
+            -- resolved rather than being shown once and forgotten.
+            CREATE TABLE IF NOT EXISTS misconceptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                concept_id INTEGER NOT NULL REFERENCES concepts(id) ON DELETE CASCADE,
+                statement TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                times_seen INTEGER NOT NULL DEFAULT 1,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                resolved_at TEXT,
+                UNIQUE (concept_id, fingerprint)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_concepts_due ON concepts(due);
             CREATE INDEX IF NOT EXISTS idx_questions_concept ON questions(concept_id);
             CREATE INDEX IF NOT EXISTS idx_reviews_concept_ts ON reviews(concept_id, ts);
+            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_misconceptions_concept
+                ON misconceptions(concept_id, resolved_at);
             """
         )
+        self._add_missing_columns(conn)
         try:
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(kind, ref_id UNINDEXED, title, body)"
@@ -171,6 +205,38 @@ class KnowledgeDB:
             conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('fts_available', '0')")
         else:
             conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('fts_available', '1')")
+
+    def _add_missing_columns(self, conn: sqlite3.Connection) -> None:
+        """Additive migrations for databases created by an earlier version.
+
+        Kept separate from ``CREATE TABLE`` so an existing ``ultralearn.db`` picks
+        up new columns without a rebuild or any data loss.
+        """
+
+        additions = {
+            "reviews": {
+                # How the concept was surfaced: due review, free practice, or a
+                # targeted drill. Previously only implied by a call argument.
+                "mode": "TEXT NOT NULL DEFAULT 'due'",
+                # The examiner's 0-5 rubric score for written answers.
+                "score": "INTEGER",
+                "graded_by": "TEXT NOT NULL DEFAULT 'self'",
+                # Denormalised so per-format analytics do not need the question
+                # row, which may be retired or deleted later.
+                "question_type": "TEXT NOT NULL DEFAULT ''",
+                "bloom": "TEXT NOT NULL DEFAULT ''",
+            },
+            "questions": {
+                "difficulty": "REAL NOT NULL DEFAULT 0.5",
+            },
+        }
+        for table, columns in additions.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not existing:
+                continue
+            for column, definition in columns.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _prepare_legacy_review_table(self, conn: sqlite3.Connection) -> None:
         """Move the original card-level review table out of the way if present."""
@@ -812,6 +878,9 @@ class KnowledgeDB:
         critique: str = "",
         provider: str = "",
         update_schedule: bool = True,
+        mode: str = "due",
+        score: int | None = None,
+        graded_by: str = "self",
     ) -> None:
         """Log a review and update the concept.
 
@@ -824,10 +893,20 @@ class KnowledgeDB:
             concept = conn.execute("SELECT * FROM concepts WHERE id=?", (concept_id,)).fetchone()
             if concept is None:
                 raise ValueError(f"Unknown concept id: {concept_id}")
+            # Denormalised so per-format analytics survive a question being retired.
+            question_type, bloom = "", ""
+            if question_id is not None:
+                question = conn.execute(
+                    "SELECT question_type, bloom FROM questions WHERE id=?", (question_id,)
+                ).fetchone()
+                if question is not None:
+                    question_type = question["question_type"]
+                    bloom = question["bloom"]
             conn.execute(
                 """INSERT INTO reviews
-                   (concept_id, question_id, ts, correct, confidence, quality, latency_seconds, answer_text, critique, provider)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (concept_id, question_id, ts, correct, confidence, quality, latency_seconds,
+                    answer_text, critique, provider, mode, score, graded_by, question_type, bloom)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     concept_id,
                     question_id,
@@ -839,6 +918,11 @@ class KnowledgeDB:
                     answer_text,
                     critique,
                     provider,
+                    mode,
+                    score,
+                    graded_by,
+                    question_type,
+                    bloom,
                 ),
             )
             mastery = self._next_mastery(conn, concept_id)
@@ -1017,6 +1101,221 @@ class KnowledgeDB:
                 (limit,),
             ).fetchall()
 
+    def daily_activity(self, days: int = 30) -> list[dict[str, Any]]:
+        """Reviews per day, most recent last, with empty days filled in."""
+
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT date(ts) AS day, COUNT(*) AS reviews,
+                       SUM(correct) AS correct
+                FROM reviews
+                WHERE date(ts) >= date('now', ?)
+                GROUP BY day
+                """,
+                (f"-{max(1, days) - 1} days",),
+            ).fetchall()
+        counts = {row["day"]: row for row in rows}
+        today = date.today()
+        out: list[dict[str, Any]] = []
+        for offset in range(days - 1, -1, -1):
+            day = (today - timedelta(days=offset)).isoformat()
+            row = counts.get(day)
+            reviews = int(row["reviews"]) if row else 0
+            correct = int(row["correct"] or 0) if row else 0
+            out.append(
+                {
+                    "date": day,
+                    "reviews": reviews,
+                    "accuracy": round(correct / reviews, 3) if reviews else None,
+                }
+            )
+        return out
+
+    def streak_days(self) -> int:
+        """Consecutive days with at least one review, counting back from today.
+
+        A streak survives until a day is actually missed, so studying today after
+        studying yesterday continues it, and not having studied *yet* today does
+        not break it.
+        """
+
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT date(ts) AS day FROM reviews ORDER BY day DESC LIMIT 400"
+            ).fetchall()
+        active = {row["day"] for row in rows}
+        if not active:
+            return 0
+        today = date.today()
+        cursor = today if today.isoformat() in active else today - timedelta(days=1)
+        streak = 0
+        while cursor.isoformat() in active:
+            streak += 1
+            cursor -= timedelta(days=1)
+        return streak
+
+    def reviewed_today(self) -> int:
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM reviews WHERE date(ts) = date('now')"
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    # ------------------------------------------------------------------
+    # Background jobs
+    # ------------------------------------------------------------------
+
+    def enqueue_job(self, kind: str, payload: dict[str, Any] | None = None, label: str = "") -> int:
+        now = utc_now()
+        with closing(self.connect()) as conn, conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO jobs (kind, label, payload_json, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'queued', ?, ?)
+                """,
+                (kind, label, json.dumps(payload or {}), now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def claim_next_job(self) -> sqlite3.Row | None:
+        """Atomically move the oldest queued job to running and return it."""
+
+        with closing(self.connect()) as conn, conn:
+            # IMMEDIATE takes the write lock up front, so two workers cannot both
+            # see the same row as queued.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE status='queued' ORDER BY created_at, id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "UPDATE jobs SET status='running', updated_at=? WHERE id=?",
+                (utc_now(), row["id"]),
+            )
+            return row
+
+    def update_job(
+        self,
+        job_id: int,
+        *,
+        progress: float | None = None,
+        detail: str | None = None,
+        status: str | None = None,
+        result: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        assignments: list[str] = ["updated_at=?"]
+        values: list[Any] = [utc_now()]
+        if progress is not None:
+            assignments.append("progress=?")
+            values.append(max(0.0, min(1.0, progress)))
+        if detail is not None:
+            assignments.append("detail=?")
+            values.append(detail)
+        if status is not None:
+            assignments.append("status=?")
+            values.append(status)
+        if result is not None:
+            assignments.append("result_json=?")
+            values.append(json.dumps(result))
+        if error is not None:
+            assignments.append("error=?")
+            values.append(error)
+        values.append(job_id)
+        with closing(self.connect()) as conn, conn:
+            conn.execute(f"UPDATE jobs SET {', '.join(assignments)} WHERE id=?", values)
+
+    def get_job(self, job_id: int) -> dict[str, Any] | None:
+        with closing(self.connect()) as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return job_to_dict(row) if row else None
+
+    def list_jobs(self, limit: int = 20, active_only: bool = False) -> list[dict[str, Any]]:
+        clause = "WHERE status IN ('queued', 'running')" if active_only else ""
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                f"SELECT * FROM jobs {clause} ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [job_to_dict(row) for row in rows]
+
+    def requeue_stale_jobs(self) -> int:
+        """Reset jobs left running by a crash so they are not stuck forever."""
+
+        with closing(self.connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET status='queued', progress=0, updated_at=? WHERE status='running'",
+                (utc_now(),),
+            )
+            return cursor.rowcount
+
+    # ------------------------------------------------------------------
+    # Misconceptions
+    # ------------------------------------------------------------------
+
+    def record_misconception(self, concept_id: int, statement: str) -> int | None:
+        """Log a named misconception, merging repeats of the same one."""
+
+        statement = statement.strip()
+        if not statement:
+            return None
+        key = fingerprint(statement)
+        now = utc_now()
+        with closing(self.connect()) as conn, conn:
+            existing = conn.execute(
+                "SELECT id FROM misconceptions WHERE concept_id=? AND fingerprint=?",
+                (concept_id, key),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE misconceptions
+                    SET times_seen = times_seen + 1, last_seen = ?, resolved_at = NULL
+                    WHERE id = ?
+                    """,
+                    (now, existing["id"]),
+                )
+                return int(existing["id"])
+            cursor = conn.execute(
+                """
+                INSERT INTO misconceptions
+                    (concept_id, statement, fingerprint, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (concept_id, statement, key, now, now),
+            )
+            return int(cursor.lastrowid)
+
+    def open_misconceptions(self, concept_id: int | None = None, limit: int = 50) -> list[sqlite3.Row]:
+        clause = "AND m.concept_id = ?" if concept_id is not None else ""
+        params: list[Any] = [concept_id] if concept_id is not None else []
+        params.append(limit)
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                f"""
+                SELECT m.*, c.title AS concept_title, t.slug AS topic_slug
+                FROM misconceptions m
+                JOIN concepts c ON c.id = m.concept_id
+                JOIN topics t ON t.id = c.topic_id
+                WHERE m.resolved_at IS NULL {clause}
+                ORDER BY m.times_seen DESC, m.last_seen DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+
+    def resolve_misconceptions(self, concept_id: int) -> int:
+        """Retire a concept's open misconceptions after a clean answer."""
+
+        with closing(self.connect()) as conn, conn:
+            cursor = conn.execute(
+                "UPDATE misconceptions SET resolved_at=? WHERE concept_id=? AND resolved_at IS NULL",
+                (utc_now(), concept_id),
+            )
+            return cursor.rowcount
+
     def search(self, query: str, limit: int = 20) -> list[sqlite3.Row]:
         query = query.strip()
         if not query:
@@ -1080,6 +1379,23 @@ class KnowledgeDB:
                 )
         except sqlite3.OperationalError:
             conn.execute("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('fts_available', '0')")
+
+
+def job_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    """Shape a job row for the API, decoding its JSON columns."""
+
+    return {
+        "id": int(row["id"]),
+        "kind": row["kind"],
+        "label": row["label"],
+        "status": row["status"],
+        "progress": float(row["progress"]),
+        "detail": row["detail"],
+        "result": json.loads(row["result_json"] or "{}"),
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def concept_from_row(row: sqlite3.Row) -> Concept:

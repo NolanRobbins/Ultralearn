@@ -1,0 +1,263 @@
+"""Zero-friction ingestion.
+
+Dropping material used to mean filling in a source type, title, author,
+identifier, topic slug and Bloom bias, waiting out a blocking generation call,
+then ticking a Keep box on every question. Almost none of that was a decision
+worth making, so none of it is asked for here.
+
+One drop becomes one job: extract, chunk, let the model name the concepts,
+classify the topic, generate questions, dedup, save. Reviewing the result is an
+audit the learner can choose to do, not a gate they must pass.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import replace
+from typing import Any
+
+from .db import KnowledgeDB, slugify
+from .generation import GENERATION_BATCH_SIZE, save_generated_questions
+from .jobs import ProgressReporter, register
+from .loaders import UnsupportedSourceError, extract_file, fetch_url
+from .providers import Provider, ProviderError
+
+#: Concepts pulled from one source in a single pass. Enough for a chapter
+#: without producing a queue the learner will never get through.
+MAX_CONCEPTS_PER_SOURCE = 12
+
+#: Questions per extracted concept.
+QUESTIONS_PER_CONCEPT = 2
+
+CONCEPT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "topic_slug": {"type": "string"},
+        "source_title": {"type": "string"},
+        "concepts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["title", "summary"],
+            },
+        },
+    },
+    "required": ["topic_slug", "concepts"],
+}
+
+CONCEPT_PROMPT = """You are indexing study material for Ultralearn, a personal teacher.
+
+Identify the distinct ideas or skills in this excerpt that are worth ingraining \
+permanently. A concept is one thing a learner could be tested on and either knows or \
+does not: "backprop chain rule", "pot odds vs implied odds", "why batch norm breaks at \
+small batch sizes". Not a section heading, not a whole topic.
+
+Rules:
+- At most {max_concepts} concepts. Fewer is better than padding with trivia.
+- Skip anything that is only navigational, bibliographic, or administrative.
+- Each summary must state the actual idea in one or two sentences, not describe what \
+the passage is about. "Explains gradients" is useless; "gradients shrink multiplicatively \
+through saturating activations, so early layers stop learning" is a concept.
+- Choose one topic_slug for the whole source from this list where it fits: \
+{topics}. Invent a short lowercase slug only if none apply.
+- Suggest a concise source_title if the material has an obvious one.
+
+EXCERPT:
+\"\"\"{text}\"\"\"
+
+Return ONLY a JSON object, no prose and no code fences:
+{{
+  "topic_slug": "one slug for the whole source",
+  "source_title": "a concise title, or \\"\\" if unclear",
+  "concepts": [{{"title": "one precise idea", "summary": "what it actually says"}}]
+}}"""
+
+
+@register("ingest")
+def run_ingest(
+    db: KnowledgeDB,
+    provider: Provider,
+    payload: dict[str, Any],
+    report: ProgressReporter,
+) -> dict[str, Any]:
+    """Take dropped material all the way to saved, answerable questions."""
+
+    report(0.05, "Reading source")
+    document = _load(payload)
+    if not document.text.strip():
+        raise UnsupportedSourceError("That source produced no readable text.")
+
+    title = (payload.get("title") or "").strip() or document.title or "Untitled source"
+    report(0.15, f"Saving {title}")
+    source_id = db.add_source(
+        document.source_type,
+        title,
+        document.author,
+        document.identifier,
+        tags=[payload["topic_slug"]] if payload.get("topic_slug") else [],
+    )
+    chunk_ids = db.add_content(source_id, document.text)
+
+    result: dict[str, Any] = {
+        "source_id": source_id,
+        "title": title,
+        "chunks": len(chunk_ids),
+        "concepts": 0,
+        "questions": 0,
+        "duplicates": 0,
+    }
+    if not payload.get("generate", True):
+        report(1.0, f"Saved {len(chunk_ids)} passages")
+        return result
+
+    report(0.25, "Finding the concepts worth learning")
+    topic_slug, concepts = extract_concepts(
+        provider, document.text, db, preferred_topic=payload.get("topic_slug", "")
+    )
+    if not concepts:
+        report(1.0, "Saved, but no concepts could be identified")
+        return result
+    result["concepts"] = len(concepts)
+
+    total_questions = 0
+    total_duplicates = 0
+    # Generate per concept so a failure costs one concept, not the whole source,
+    # and so each question is anchored to a specific idea rather than a page.
+    for index, concept in enumerate(concepts):
+        fraction = 0.3 + 0.65 * (index / max(1, len(concepts)))
+        report(fraction, f"Writing questions: {concept['title']}")
+        context = _context_for(document.text, concept)
+        try:
+            generated = provider.generate_questions(
+                text=context,
+                n=min(QUESTIONS_PER_CONCEPT, GENERATION_BATCH_SIZE),
+                topic_slug=topic_slug,
+                source_title=title,
+                concept_title=concept["title"],
+            )
+        except ProviderError:
+            # One unlucky concept must not sink an otherwise good ingest.
+            continue
+        # Pin every question to the concept we indexed, so the generator cannot
+        # quietly invent a parallel set of concept names for the same material.
+        anchored = [
+            replace(
+                question,
+                concept_title=concept["title"],
+                concept_summary=concept["summary"] or question.concept_summary,
+                topic_slug=topic_slug,
+            )
+            for question in generated
+        ]
+        saved = save_generated_questions(db, anchored, source_id=source_id)
+        total_questions += saved.saved
+        total_duplicates += saved.duplicates
+
+    result["questions"] = total_questions
+    result["duplicates"] = total_duplicates
+    report(1.0, f"{total_questions} questions across {len(concepts)} concepts")
+    return result
+
+
+def extract_concepts(
+    provider: Provider,
+    text: str,
+    db: KnowledgeDB,
+    preferred_topic: str = "",
+) -> tuple[str, list[dict[str, str]]]:
+    """Ask the provider to name the concepts in a source and classify its topic."""
+
+    known = [row["slug"] for row in db.list_topics()]
+    prompt = CONCEPT_PROMPT.format(
+        max_concepts=MAX_CONCEPTS_PER_SOURCE,
+        topics=", ".join(known) or "general",
+        text=text[:14000],
+    )
+    complete = getattr(provider, "_complete", None)
+    if complete is None:
+        raise ProviderError("This provider cannot extract concepts.")
+    payload = _first_json_object(complete(prompt, schema=CONCEPT_SCHEMA))
+    if not payload:
+        raise ProviderError("The provider did not return a readable concept list.")
+
+    topic_slug = preferred_topic or slugify(str(payload.get("topic_slug") or "general"))
+    concepts: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in payload.get("concepts") or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title or title.lower() in seen:
+            continue
+        seen.add(title.lower())
+        concepts.append({"title": title, "summary": str(item.get("summary") or "").strip()})
+        if len(concepts) >= MAX_CONCEPTS_PER_SOURCE:
+            break
+    return topic_slug or "general", concepts
+
+
+def _load(payload: dict[str, Any]):
+    """Resolve an ingest payload into a document, whatever form it arrived in."""
+
+    if payload.get("raw"):
+        data = bytes.fromhex(payload["raw"])
+        return extract_file(payload.get("filename", "upload"), data)
+    if payload.get("url"):
+        return fetch_url(payload["url"])
+
+    from .loaders import ExtractedDocument, _markdown_title
+
+    text = payload.get("text", "")
+    return ExtractedDocument(
+        text=text,
+        title=payload.get("title") or _markdown_title(text),
+        source_type=payload.get("source_type", "note"),
+    )
+
+
+def _context_for(text: str, concept: dict[str, str], window: int = 6000) -> str:
+    """Give the generator the part of the source that discusses this concept.
+
+    A cheap keyword window rather than an embedding lookup: the chunks are not
+    indexed yet at this point in the pipeline, and being approximately right is
+    enough to keep the question anchored to real material.
+    """
+
+    if len(text) <= window:
+        return text
+    needle = concept["title"].lower()
+    position = text.lower().find(needle)
+    if position == -1:
+        words = [word for word in re.findall(r"[a-z]{5,}", needle)]
+        for word in words:
+            position = text.lower().find(word)
+            if position != -1:
+                break
+    if position == -1:
+        return text[:window]
+    start = max(0, position - window // 3)
+    return text[start : start + window]
+
+
+def _first_json_object(raw: str) -> dict[str, Any] | None:
+    text = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        return None
+    candidate = text[start : end + 1]
+    for attempt in (candidate, re.sub(r",(\s*[}\]])", r"\1", candidate)):
+        try:
+            parsed = json.loads(attempt)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
