@@ -19,6 +19,12 @@ class AppConfig:
     provider: str = "claude_code"
     model: str = "claude-sonnet-4-6"
     claude_command: str = "claude"
+    #: Model alias handed to the Claude Code CLI. Aliases like "sonnet" always
+    #: resolve to the current release, whereas dated full names go stale and make
+    #: the CLI fail outright, so this is kept separate from the API `model`.
+    claude_model: str = "sonnet"
+    #: Used only when the primary model is overloaded. Empty disables fallback.
+    claude_fallback_model: str = ""
     ollama_url: str = "http://localhost:11434/api/generate"
     ollama_model: str = "llama3.1"
     provider_timeout_seconds: int = 300
@@ -30,6 +36,8 @@ class AppConfig:
             provider=os.environ.get("ULTRALEARN_PROVIDER", "claude_code"),
             model=os.environ.get("ULTRALEARN_MODEL", "claude-sonnet-4-6"),
             claude_command=os.environ.get("CLAUDE_CODE_COMMAND", "claude"),
+            claude_model=os.environ.get("ULTRALEARN_CLAUDE_MODEL", "sonnet"),
+            claude_fallback_model=os.environ.get("ULTRALEARN_CLAUDE_FALLBACK_MODEL", ""),
             ollama_url=os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate"),
             ollama_model=os.environ.get("OLLAMA_MODEL", "llama3.1"),
             provider_timeout_seconds=int(os.environ.get("ULTRALEARN_PROVIDER_TIMEOUT", "300")),

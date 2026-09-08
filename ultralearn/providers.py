@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
@@ -28,9 +31,63 @@ QUESTION_TYPES = [
     "applied_scenario",
 ]
 
+BLOOM_LEVELS = ["recall", "apply", "analyze"]
+
+#: JSON Schema for a batch of generated questions. Handed to CLIs that support
+#: schema-constrained output so the response is machine-valid by construction
+#: instead of being hand-written JSON that has to survive string parsing.
+QUESTION_BATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "concept_title": {"type": "string"},
+                    "concept_summary": {"type": "string"},
+                    "topic_slug": {"type": "string"},
+                    "question_type": {"type": "string", "enum": QUESTION_TYPES},
+                    "prompt": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}},
+                    "answer": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer"},
+                            "indices": {"type": "array", "items": {"type": "integer"}},
+                            "text": {"type": "string"},
+                        },
+                    },
+                    "explanation": {"type": "string"},
+                    "bloom": {"type": "string", "enum": BLOOM_LEVELS},
+                },
+                "required": [
+                    "concept_title",
+                    "question_type",
+                    "prompt",
+                    "answer",
+                    "explanation",
+                    "bloom",
+                ],
+            },
+        }
+    },
+    "required": ["questions"],
+}
+
 
 class ProviderError(RuntimeError):
     """Raised when a provider cannot complete a requested LLM task."""
+
+
+class ProviderAuthError(ProviderError):
+    """Raised when a provider is installed and reachable but not logged in.
+
+    Worth distinguishing: an expired Claude Code OAuth token still returns a
+    success exit code, but only after the CLI has spent minutes retrying the 401
+    internally. Surfacing it as its own error lets callers say "log in" instead
+    of "something timed out".
+    """
 
 
 class Provider(ABC):
@@ -114,7 +171,7 @@ class PromptProvider(Provider):
         prompt = build_generation_prompt(
             text, n, topic_slug, source_title, concept_title, bloom_hint, avoid_prompts
         )
-        return parse_questions(self._complete(prompt))
+        return parse_questions(self._complete(prompt, schema=QUESTION_BATCH_SCHEMA))
 
     def critique(self, question: str, expected_answer: str, learner_answer: str) -> str:
         prompt = f"""You are Ultralearn's demanding examiner. Be precise, skeptical, and useful.
@@ -152,61 +209,251 @@ Review context:
         return self._complete(prompt).strip()
 
     @abstractmethod
-    def _complete(self, prompt: str) -> str:
-        """Run the provider-specific completion call."""
+    def _complete(self, prompt: str, schema: dict[str, Any] | None = None) -> str:
+        """Run the provider-specific completion call.
+
+        ``schema`` is an optional JSON Schema describing the expected response.
+        Providers that can constrain output to a schema should use it; the rest
+        ignore it and rely on the prompt plus tolerant parsing.
+        """
+
+
+#: Ultralearn only ever asks the CLI to write text, so every tool is denied. This
+#: keeps a generation call from wandering into the filesystem or the network, and
+#: removes an entire class of multi-turn stalls.
+DENIED_TOOLS = (
+    "Bash,Edit,Write,Read,WebFetch,WebSearch,Glob,Grep,Task,"
+    "NotebookEdit,NotebookRead,MultiEdit,TodoWrite"
+)
+
+#: Substrings that mean "the CLI works but you are not logged in".
+_AUTH_ERROR_MARKERS = (
+    "oauth access token has expired",
+    "please run /login",
+    "authentication_error",
+    "invalid api key",
+    "invalid bearer token",
+)
+
+_USAGE_ERROR_MARKERS = (
+    "unknown option",
+    "unknown argument",
+    "invalid mcp configuration",
+    "error: option",
+    "unknown command",
+)
+
+
+@functools.lru_cache(maxsize=8)
+def claude_cli_flags(executable: str) -> frozenset[str]:
+    """Return the subset of flags Ultralearn cares about that this CLI supports.
+
+    Claude Code's flag surface moves between releases: ``--json-schema`` only
+    exists from v2.1.205. Probing ``--help`` once lets a single code path serve
+    old and new CLIs instead of hard-failing on whichever machine is older.
+    """
+
+    try:
+        proc = subprocess.run(
+            [executable, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    help_text = f"{proc.stdout}\n{proc.stderr}"
+    candidates = (
+        "--json-schema",
+        "--strict-mcp-config",
+        "--mcp-config",
+        "--setting-sources",
+        "--fallback-model",
+        "--disallowedTools",
+        "--model",
+        "--append-system-prompt",
+    )
+    return frozenset(flag for flag in candidates if flag in help_text)
+
+
+@functools.lru_cache(maxsize=1)
+def _scratch_dir() -> str:
+    """An empty directory to run the CLI from.
+
+    Claude Code reads ``CLAUDE.md`` and settings from its working directory, so
+    running from the project would inject unrelated instructions into every
+    study prompt. (User-level ``~/.claude/CLAUDE.md`` still loads; only ``--bare``
+    suppresses that, and ``--bare`` also disables OAuth, which would force an API
+    key and defeat the point of using the local CLI.)
+    """
+
+    path = Path(tempfile.gettempdir()) / "ultralearn-claude-scratch"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 class ClaudeCodeProvider(PromptProvider):
-    """Subprocess-backed provider for local Claude Code CLI usage.
+    """Subprocess-backed provider driving the local Claude Code CLI.
 
-    Uses ``--output-format json`` so each call reports cost, token counts, and
-    duration, which the UI surfaces as running usage.
+    Every call is isolated: no MCP servers, no project settings, no tools, and a
+    scratch working directory. The prompt goes in on stdin rather than argv so
+    long excerpts are never subject to argument-length or quoting limits, and
+    ``--output-format json`` gives back cost, token counts, and duration.
     """
 
     name = "claude_code"
 
-    def __init__(self, command: str = "claude", timeout_seconds: int = 300) -> None:
+    def __init__(
+        self,
+        command: str = "claude",
+        timeout_seconds: int = 300,
+        model: str = "sonnet",
+        fallback_model: str = "",
+    ) -> None:
         self.command = command
         self.timeout_seconds = timeout_seconds
+        self.model = model
+        self.fallback_model = fallback_model
+        self._health: tuple[bool, str] | None = None
+
+    @property
+    def executable(self) -> str:
+        parts = shlex.split(self.command) if self.command.strip() else []
+        return parts[0] if parts else "claude"
 
     def available(self) -> bool:
-        executable = shlex.split(self.command)[0] if self.command.strip() else "claude"
-        return shutil.which(executable) is not None
+        return shutil.which(self.executable) is not None
 
-    def _complete(self, prompt: str) -> str:
-        parts = shlex.split(self.command)
-        if not parts:
-            parts = ["claude"]
-        if any("{prompt}" in part for part in parts):
-            cmd = [part.replace("{prompt}", prompt) for part in parts]
-        else:
-            cmd = parts + ["-p", prompt]
-            if "--output-format" not in parts:
-                cmd += ["--output-format", "json"]
-        started = time.monotonic()
+    def check_auth(self, timeout_seconds: int = 25) -> tuple[bool, str]:
+        """Cheaply establish whether the CLI is logged in.
+
+        An expired token makes the CLI retry the 401 internally for minutes before
+        returning, so without a bounded preflight every call looks like a timeout.
+        The result is cached for the life of the provider.
+        """
+
+        if self._health is not None:
+            return self._health
+        if not self.available():
+            self._health = (False, "Claude Code CLI was not found on PATH.")
+            return self._health
         try:
-            # stdin must be closed: in -p mode the CLI can silently wait for
-            # interactive input (e.g. when logged out) instead of erroring.
             proc = subprocess.run(
+                self._build_command(schema=None),
+                input="Reply with exactly: OK",
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            # Almost always an expired token being retried behind the scenes.
+            self._health = (
+                False,
+                "Claude Code did not respond within "
+                f"{timeout_seconds}s. This usually means the login has expired — "
+                "run `claude` in a terminal, then `/login`.",
+            )
+            return self._health
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._health = (False, f"Claude Code could not be started: {exc}")
+            return self._health
+
+        combined = f"{proc.stdout}\n{proc.stderr}".lower()
+        if any(marker in combined for marker in _AUTH_ERROR_MARKERS):
+            self._health = (False, _AUTH_HELP)
+            return self._health
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            self._health = (False, f"Claude Code failed: {detail[:300]}")
+            return self._health
+        self._health = (True, "Claude Code is ready.")
+        return self._health
+
+    def _build_command(self, schema: dict[str, Any] | None, isolated: bool = True) -> list[str]:
+        """Assemble the CLI invocation, using only flags this CLI understands."""
+
+        parts = shlex.split(self.command) if self.command.strip() else ["claude"]
+        # A custom command containing {prompt} is honoured verbatim so power users
+        # can wrap the CLI however they like.
+        if any("{prompt}" in part for part in parts):
+            return parts
+
+        cmd = list(parts)
+        if "-p" not in cmd and "--print" not in cmd:
+            cmd.append("-p")
+        if "--output-format" not in cmd:
+            cmd += ["--output-format", "json"]
+
+        flags = claude_cli_flags(self.executable)
+        if self.model and "--model" in flags and "--model" not in cmd:
+            cmd += ["--model", self.model]
+        if self.fallback_model and "--fallback-model" in flags:
+            cmd += ["--fallback-model", self.fallback_model]
+
+        if isolated:
+            if "--strict-mcp-config" in flags:
+                cmd.append("--strict-mcp-config")
+                if "--mcp-config" in flags:
+                    # An empty server map, not `{}` — the CLI validates the shape.
+                    cmd += ["--mcp-config", json.dumps({"mcpServers": {}})]
+            if "--setting-sources" in flags:
+                cmd += ["--setting-sources", ""]
+            if "--disallowedTools" in flags:
+                cmd += ["--disallowedTools", DENIED_TOOLS]
+
+        if schema is not None and "--json-schema" in flags:
+            cmd += ["--json-schema", json.dumps(schema)]
+        return cmd
+
+    def _complete(self, prompt: str, schema: dict[str, Any] | None = None) -> str:
+        healthy, message = self.check_auth()
+        if not healthy:
+            raise ProviderAuthError(message)
+
+        cmd = self._build_command(schema)
+        legacy_prompt = any("{prompt}" in part for part in cmd)
+        if legacy_prompt:
+            cmd = [part.replace("{prompt}", prompt) for part in cmd]
+
+        started = time.monotonic()
+        proc = self._run(cmd, prompt if not legacy_prompt else None)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            # An unrecognised isolation flag should degrade, not break the app.
+            if any(marker in detail.lower() for marker in _USAGE_ERROR_MARKERS):
+                cmd = self._build_command(schema=None, isolated=False)
+                proc = self._run(cmd, prompt)
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                raise ProviderError(f"Claude Code failed: {detail[:800]}")
+        return self._extract_result(proc.stdout, elapsed_seconds=time.monotonic() - started)
+
+    def _run(self, cmd: list[str], stdin_prompt: str | None) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
                 cmd,
+                # The prompt arrives on stdin, so excerpt length is never bounded
+                # by ARG_MAX and no shell quoting can corrupt it. When stdin is
+                # not the prompt it must still be closed: in -p mode the CLI can
+                # otherwise wait forever for interactive input.
+                input=stdin_prompt if stdin_prompt is not None else "",
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
-                stdin=subprocess.DEVNULL,
+                cwd=_scratch_dir(),
             )
         except FileNotFoundError as exc:
             raise ProviderError("Claude Code CLI was not found on PATH.") from exc
         except subprocess.TimeoutExpired as exc:
             raise ProviderError(
-                f"Claude Code timed out after {self.timeout_seconds}s. Check that you are logged in "
-                "(`claude` then /login) and that `claude -p 'ok'` works in a terminal; if it is just "
-                "slow, raise the provider timeout in Settings."
+                f"Claude Code timed out after {self.timeout_seconds}s. Generation runs in small "
+                "batches, so this usually means the CLI itself is stuck — check that `claude -p 'ok'` "
+                "returns promptly in a terminal, or raise the provider timeout in Settings."
             ) from exc
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            raise ProviderError(f"Claude Code failed: {detail[:800]}")
-        return self._extract_result(proc.stdout, elapsed_seconds=time.monotonic() - started)
 
     def _extract_result(self, stdout: str, elapsed_seconds: float | None = None) -> str:
         """Unwrap the Claude Code JSON envelope and record usage; pass raw text through."""
@@ -229,8 +476,27 @@ class ClaudeCodeProvider(PromptProvider):
             "output_tokens": usage.get("output_tokens"),
         }
         if envelope.get("is_error"):
-            raise ProviderError(f"Claude Code returned an error: {str(envelope.get('result'))[:800]}")
+            detail = str(envelope.get("result") or "")
+            if any(marker in detail.lower() for marker in _AUTH_ERROR_MARKERS):
+                self._health = (False, _AUTH_HELP)
+                raise ProviderAuthError(_AUTH_HELP)
+            raise ProviderError(f"Claude Code returned an error: {detail[:800]}")
+
+        # With --json-schema the CLI returns a validated object; preferring it
+        # removes the whole class of "model wrote slightly broken JSON" failures.
+        structured = envelope.get("structured_output")
+        if isinstance(structured, dict) and "questions" in structured:
+            return json.dumps(structured["questions"])
+        if isinstance(structured, list):
+            return json.dumps(structured)
         return str(envelope.get("result") or "")
+
+
+_AUTH_HELP = (
+    "Claude Code is not logged in — its OAuth token has expired. Run `claude` in a "
+    "terminal and use `/login`, then try again. (Ultralearn deliberately avoids "
+    "`--bare`, which would bypass your subscription and require an API key.)"
+)
 
 
 class AnthropicProvider(PromptProvider):
@@ -250,7 +516,7 @@ class AnthropicProvider(PromptProvider):
             return False
         return True
 
-    def _complete(self, prompt: str) -> str:
+    def _complete(self, prompt: str, schema: dict[str, Any] | None = None) -> str:
         if not self.available():
             raise ProviderError("Anthropic provider needs the anthropic package and ANTHROPIC_API_KEY.")
         from anthropic import Anthropic
@@ -281,7 +547,7 @@ class OpenAIProvider(PromptProvider):
             return False
         return True
 
-    def _complete(self, prompt: str) -> str:
+    def _complete(self, prompt: str, schema: dict[str, Any] | None = None) -> str:
         if not self.available():
             raise ProviderError("OpenAI provider needs the openai package and OPENAI_API_KEY.")
         from openai import OpenAI
@@ -311,7 +577,7 @@ class OllamaProvider(PromptProvider):
         except Exception:
             return False
 
-    def _complete(self, prompt: str) -> str:
+    def _complete(self, prompt: str, schema: dict[str, Any] | None = None) -> str:
         payload = json.dumps({"model": self.model, "prompt": prompt, "stream": False}).encode("utf-8")
         request = urllib.request.Request(self.url, data=payload, headers={"Content-Type": "application/json"})
         try:
@@ -330,7 +596,12 @@ def build_provider(
 ) -> Provider:
     normalized = (name or "claude_code").strip().lower()
     if normalized == "claude_code":
-        return ClaudeCodeProvider(config.claude_command, config.provider_timeout_seconds)
+        return ClaudeCodeProvider(
+            config.claude_command,
+            config.provider_timeout_seconds,
+            model=config.claude_model,
+            fallback_model=config.claude_fallback_model,
+        )
     if normalized == "anthropic":
         return AnthropicProvider(config.model, anthropic_key or None, config.provider_timeout_seconds)
     if normalized == "openai":
