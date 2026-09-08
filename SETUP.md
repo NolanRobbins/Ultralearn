@@ -17,7 +17,6 @@ fresh clone stays small:
 uv sync --extra desktop      # native app window (pywebview)
 uv sync --extra semantic     # true embeddings via sentence-transformers (~2GB, pulls torch)
 uv sync --extra epub         # EPUB ingestion
-uv sync --extra legacy-ui    # the old Streamlit UI
 ```
 
 Without the `semantic` extra, Focus search falls back to a dependency-free
@@ -47,9 +46,28 @@ a scratch directory so your `CLAUDE.md` and project settings never leak into a p
 ## 3. Run it
 
 ```bash
-uv run ultralearn-api          # API only, http://127.0.0.1:8765
 uv run ultralearn              # native desktop window
-uv run streamlit run app.py    # legacy Streamlit UI (needs --extra legacy-ui)
+uv run ultralearn --browser    # same app, in your default browser
+```
+
+### Working on the frontend
+
+The UI is a Vite + React app in `desktop/`. For hot reload, run the API and the
+dev server side by side:
+
+```bash
+uv run ultralearn-api                      # prints the API token
+cd desktop && npm install && npm run dev    # http://localhost:5173
+```
+
+Vite proxies `/api` to the backend. Paste the printed token into the dev URL once
+(`http://localhost:5173/?token=…`); it is kept in sessionStorage after that.
+
+To bundle the UI into the desktop app, build it — the API serves `desktop/dist`
+automatically when it exists:
+
+```bash
+cd desktop && npm run build
 ```
 
 ## 4. Your data

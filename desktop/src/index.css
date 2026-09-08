@@ -1,0 +1,155 @@
+@import "tailwindcss";
+
+/*
+  Design tokens.
+
+  Every foreground/background pair here clears WCAG AA (4.5:1 for body text,
+  3:1 for large text and UI edges). The previous UI failed exactly this — its
+  sidebar text was unreadable — so contrast is a defined property of the system
+  rather than something each component improvises.
+
+  Measured against --color-bg (#0b0e13):
+    text        #e9eef5  ~15.6:1
+    text-dim    #a7b4c4  ~8.4:1
+    text-faint  #7d8b9c  ~5.2:1
+    accent      #3ecf8e  ~8.6:1
+*/
+@theme {
+  --color-bg: #0b0e13;
+  --color-surface: #141924;
+  --color-raised: #1b2130;
+  --color-border: #273040;
+  --color-border-strong: #3a465c;
+
+  --color-text: #e9eef5;
+  --color-dim: #a7b4c4;
+  --color-faint: #7d8b9c;
+
+  --color-accent: #3ecf8e;
+  --color-accent-soft: #123026;
+  --color-correct: #4ade80;
+  --color-partial: #fbbf24;
+  --color-wrong: #fb7185;
+  --color-info: #7dd3fc;
+
+  --font-sans: ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI", system-ui,
+    sans-serif;
+  /* Question prompts are set in a serif: they are meant to be read and thought
+     about, not scanned like UI chrome. */
+  --font-read: ui-serif, "New York", Georgia, "Times New Roman", serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+
+  --radius-card: 0.75rem;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-text);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    /* This is a desktop window, not a web page: no rubber-banding, no text
+       selection on chrome, no native drag of the whole document. */
+    overscroll-behavior: none;
+  }
+
+  /* Numbers that change in place (scores, counters, timers) must not reflow. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background: var(--color-accent-soft);
+    color: var(--color-text);
+  }
+
+  /* Keyboard users get a visible ring; pointer users do not. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-border);
+    border-radius: 999px;
+    border: 2px solid var(--color-bg);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-border-strong);
+  }
+}
+
+@layer utilities {
+  .kbd {
+    @apply inline-flex h-5 min-w-5 items-center justify-center rounded border border-border
+      bg-raised px-1.5 font-mono text-[11px] leading-none text-faint;
+  }
+
+  /* Answer feedback should register physically, not just chromatically. */
+  @keyframes answer-correct {
+    0% {
+      transform: scale(1);
+    }
+    40% {
+      transform: scale(1.012);
+    }
+    100% {
+      transform: scale(1);
+    }
+  }
+
+  @keyframes answer-wrong {
+    0%,
+    100% {
+      transform: translateX(0);
+    }
+    20% {
+      transform: translateX(-5px);
+    }
+    45% {
+      transform: translateX(4px);
+    }
+    70% {
+      transform: translateX(-2px);
+    }
+  }
+
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .animate-correct {
+    animation: answer-correct 420ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .animate-wrong {
+    animation: answer-wrong 380ms cubic-bezier(0.36, 0.07, 0.19, 0.97);
+  }
+  .animate-rise {
+    animation: rise 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-correct,
+    .animate-wrong,
+    .animate-rise {
+      animation: none;
+    }
+  }
+}

@@ -77,6 +77,9 @@ class AppState:
     def update_settings(self, values: dict[str, str]) -> None:
         self._settings.update(values)
 
+    def setting(self, key: str, default: str = "") -> str:
+        return self._settings.get(key, default)
+
 
 def create_app(config: AppConfig | None = None) -> FastAPI:
     state = AppState(config or AppConfig.from_env())
@@ -386,6 +389,28 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                 await asyncio.sleep(0.6)
 
         return EventSourceResponse(publish())
+
+    @app.post("/api/coaching", response_model=JobOut)
+    def request_coaching(app_state: AppState = Guarded) -> JobOut:
+        job_id = app_state.db.enqueue_job("coaching", {}, label="Diagnostic report")
+        found = app_state.db.get_job(job_id)
+        assert found is not None
+        return JobOut(**found)
+
+    @app.get("/api/coaching")
+    def coaching_reports(app_state: AppState = Guarded) -> list[dict[str, Any]]:
+        return [dict(row) for row in app_state.db.recent_coaching_reports(limit=10)]
+
+    @app.get("/api/settings")
+    def read_settings(app_state: AppState = Guarded) -> dict[str, Any]:
+        config = app_state.config
+        return {
+            "provider": app_state.setting("provider", config.provider),
+            "providers": ["claude_code", "anthropic", "openai", "ollama", "manual"],
+            "claude_model": config.claude_model,
+            "db_path": str(config.db_path),
+            "timeout_seconds": config.provider_timeout_seconds,
+        }
 
     @app.post("/api/settings")
     def settings(values: dict[str, str], app_state: AppState = Guarded) -> dict[str, str]:

@@ -164,6 +164,41 @@ def run_ingest(
     return result
 
 
+@register("coaching")
+def run_coaching(
+    db: KnowledgeDB,
+    provider: Provider,
+    payload: dict[str, Any],
+    report: ProgressReporter,
+) -> dict[str, Any]:
+    """Write a diagnostic report from the review history.
+
+    A job rather than a request: it reads the whole history and can take a while,
+    and there is no reason for the learner to sit and watch it.
+    """
+
+    report(0.2, "Reading your review history")
+    context = db.coaching_context()
+    if not context.strip():
+        raise ProviderError("There is no review history to analyse yet.")
+
+    # Misconceptions are the most diagnostic thing on record, so they go in
+    # explicitly rather than being left for the model to infer from accuracy.
+    open_items = db.open_misconceptions(limit=30)
+    if open_items:
+        lines = "\n".join(
+            f"- {row['concept_title']}: {row['statement']} (seen {row['times_seen']}x)"
+            for row in open_items
+        )
+        context = f"{context}\n\nUNRESOLVED MISCONCEPTIONS:\n{lines}"
+
+    report(0.5, "Asking for an honest assessment")
+    text = provider.analyze_weakspots(context)
+    db.save_coaching_report(provider.name, text)
+    report(1.0, "Report ready")
+    return {"characters": len(text)}
+
+
 def extract_concepts(
     provider: Provider,
     text: str,

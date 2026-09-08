@@ -26,8 +26,6 @@ desktop = ["pywebview>=5.0"]
 semantic = ["sentence-transformers>=3.0"]
 # EPUB ingestion.
 epub = ["EbookLib>=0.18"]
-# The Streamlit UI, retired once the desktop app reaches parity.
-legacy-ui = ["streamlit>=1.40"]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
