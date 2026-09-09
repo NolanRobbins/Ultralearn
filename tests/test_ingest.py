@@ -12,6 +12,7 @@ from ultralearn.loaders import (
     _normalize_arxiv,
     extract_file,
     html_to_text,
+    iter_supported_files,
 )
 from ultralearn.models import ProviderQuestion
 from ultralearn.providers import PromptProvider, ProviderError
@@ -225,3 +226,34 @@ def test_html_to_text_survives_without_beautifulsoup(monkeypatch):
     text = html_to_text("<p>Gradients <b>shrink</b>.</p><script>x()</script>")
     assert "Gradients" in text and "shrink" in text
     assert "<" not in text and "x()" not in text
+
+
+def test_folder_ingest_skips_unsupported_files_and_saves_the_rest(db, tmp_path):
+    folder = tmp_path / "pack"
+    folder.mkdir()
+    (folder / "keep.md").write_text("# Keep\nGradients shrink through saturating activations.")
+    (folder / "skip.png").write_bytes(b"not a picture")
+    (folder / ".hidden.md").write_text("should be ignored")
+    nested = folder / "more"
+    nested.mkdir()
+    (nested / "also.txt").write_text("Batch norm estimates get noisy at small batches.")
+
+    provider = ScriptedProvider([{"title": "A concept", "summary": "s"}])
+    job_id = db.enqueue_job("ingest_folder", {"folder": str(folder), "generate": False})
+    JobWorker(db, lambda: provider).run_once()
+    result = db.get_job(job_id)
+    assert result["status"] == "succeeded"
+    assert result["result"]["files"] == 2
+    assert result["result"]["failed"] == 0
+    titles = {row["title"] for row in db.list_sources()}
+    assert "Keep" in titles
+
+
+def test_iter_supported_files_ignores_hidden_and_unknown_types(tmp_path):
+    folder = tmp_path / "notes"
+    folder.mkdir()
+    (folder / "a.md").write_text("a")
+    (folder / "b.png").write_bytes(b"x")
+    (folder / ".secret.md").write_text("no")
+    found = [path.name for path in iter_supported_files(folder)]
+    assert found == ["a.md"]

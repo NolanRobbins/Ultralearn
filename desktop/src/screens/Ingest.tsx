@@ -17,20 +17,40 @@ export function Ingest() {
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
+  const folderInput = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     api.jobs().then(setJobs).catch(() => undefined);
     return subscribeToJobs(setJobs);
   }, []);
 
+  useEffect(() => {
+    const el = folderInput.current;
+    if (!el) return;
+    el.setAttribute("webkitdirectory", "");
+    el.setAttribute("directory", "");
+  }, []);
+
+  const SUPPORTED = /\.(pdf|epub|docx|md|markdown|txt|rst|html|htm)$/i;
+
   const submitFiles = useCallback(async (files: FileList | File[]) => {
     setError("");
-    for (const file of Array.from(files)) {
+    const readable = Array.from(files).filter((file) => SUPPORTED.test(file.name));
+    const skipped = Array.from(files).length - readable.length;
+    if (!readable.length) {
+      setError("None of those files are a format Ultralearn can read yet.");
+      return;
+    }
+    for (const file of readable) {
       try {
         await api.ingestFile(file);
       } catch (exception) {
         setError(`${file.name}: ${(exception as Error).message}`);
+        return;
       }
+    }
+    if (skipped > 0) {
+      setError(`Skipped ${skipped} unsupported file${skipped === 1 ? "" : "s"}.`);
     }
   }, []);
 
@@ -78,18 +98,34 @@ export function Ingest() {
             : "border-border bg-surface hover:border-border-strong",
         )}
       >
-        <p className="text-text">Drop a PDF, EPUB, Markdown, or text file</p>
+        <p className="text-text">Drop a file, a folder, or a link</p>
         <p className="mt-1 text-sm text-faint">
-          or click to browse · a link works too, including arXiv
+          PDF, Word, EPUB, Markdown, HTML, or text · arXiv links work too
         </p>
         <input
           ref={fileInput}
           type="file"
           multiple
           hidden
-          accept=".pdf,.epub,.md,.markdown,.txt,.rst,.html,.htm"
+          accept=".pdf,.epub,.docx,.md,.markdown,.txt,.rst,.html,.htm"
           onChange={(event) => event.target.files && submitFiles(event.target.files)}
         />
+        <input
+          ref={folderInput}
+          type="file"
+          hidden
+          multiple
+          onChange={(event) => event.target.files && submitFiles(event.target.files)}
+        />
+      </div>
+
+      <div className="mt-3 flex gap-2">
+        <Button size="sm" onClick={() => fileInput.current?.click()}>
+          Choose files
+        </Button>
+        <Button size="sm" onClick={() => folderInput.current?.click()}>
+          Choose a folder
+        </Button>
       </div>
 
       {error && (

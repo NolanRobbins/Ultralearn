@@ -45,6 +45,10 @@ class KnowledgeDB:
         with closing(self.connect()) as conn, conn:
             self._create_schema(conn)
             self._seed_topics(conn)
+            self._seed_code_problems(conn)
+            self._seed_math_formulas(conn)
+            self._relink_code_problems(conn)
+            self._relink_math_formulas(conn)
             self._migrate_legacy_cards(conn)
             self._rebuild_search_index(conn)
 
@@ -188,12 +192,69 @@ class KnowledgeDB:
                 UNIQUE (concept_id, fingerprint)
             );
 
+            CREATE TABLE IF NOT EXISTS code_problems (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                starter TEXT NOT NULL,
+                tests TEXT NOT NULL,
+                difficulty TEXT NOT NULL DEFAULT 'medium',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                concept_hints_json TEXT NOT NULL DEFAULT '[]',
+                concept_id INTEGER REFERENCES concepts(id) ON DELETE SET NULL,
+                timeout_seconds INTEGER NOT NULL DEFAULT 8,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS code_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                problem_id INTEGER NOT NULL REFERENCES code_problems(id) ON DELETE CASCADE,
+                ts TEXT NOT NULL,
+                passed INTEGER NOT NULL,
+                passed_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                runtime_ms INTEGER,
+                code TEXT NOT NULL,
+                output TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS math_formulas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                latex TEXT NOT NULL,
+                spoken TEXT NOT NULL,
+                intuition TEXT NOT NULL DEFAULT '',
+                key_phrases_json TEXT NOT NULL DEFAULT '[]',
+                blanks_json TEXT NOT NULL DEFAULT '[]',
+                terms_json TEXT NOT NULL DEFAULT '[]',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                concept_hints_json TEXT NOT NULL DEFAULT '[]',
+                concept_id INTEGER REFERENCES concepts(id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS math_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                formula_id INTEGER NOT NULL REFERENCES math_formulas(id) ON DELETE CASCADE,
+                ts TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                passed INTEGER NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '{}'
+            );
+
             CREATE INDEX IF NOT EXISTS idx_concepts_due ON concepts(due);
             CREATE INDEX IF NOT EXISTS idx_questions_concept ON questions(concept_id);
             CREATE INDEX IF NOT EXISTS idx_reviews_concept_ts ON reviews(concept_id, ts);
             CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
             CREATE INDEX IF NOT EXISTS idx_misconceptions_concept
                 ON misconceptions(concept_id, resolved_at);
+            CREATE INDEX IF NOT EXISTS idx_code_attempts_problem
+                ON code_attempts(problem_id, ts);
+            CREATE INDEX IF NOT EXISTS idx_math_attempts_formula
+                ON math_attempts(formula_id, ts);
             """
         )
         self._add_missing_columns(conn)
@@ -263,6 +324,111 @@ class KnowledgeDB:
                 "INSERT OR IGNORE INTO topics (slug, name, created_at) VALUES (?, ?, ?)",
                 (slug, name, now),
             )
+
+    def _seed_code_problems(self, conn: sqlite3.Connection) -> None:
+        from .code_bank import PROBLEMS
+
+        now = utc_now()
+        for problem in PROBLEMS:
+            conn.execute(
+                """
+                INSERT INTO code_problems (
+                    slug, title, prompt, starter, tests, difficulty, tags_json,
+                    concept_hints_json, timeout_seconds, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    title=excluded.title,
+                    prompt=excluded.prompt,
+                    starter=excluded.starter,
+                    tests=excluded.tests,
+                    difficulty=excluded.difficulty,
+                    tags_json=excluded.tags_json,
+                    concept_hints_json=excluded.concept_hints_json
+                """,
+                (
+                    problem["slug"],
+                    problem["title"],
+                    problem["prompt"],
+                    problem["starter"],
+                    problem["tests"],
+                    problem["difficulty"],
+                    json.dumps(problem.get("tags", [])),
+                    json.dumps(problem.get("concept_hints", [])),
+                    int(problem.get("timeout_seconds", 8)),
+                    now,
+                ),
+            )
+
+    def _relink_code_problems(self, conn: sqlite3.Connection) -> None:
+        """Attach unlinked drills to a matching library concept when one exists."""
+
+        concepts = conn.execute("SELECT id, title FROM concepts").fetchall()
+        if not concepts:
+            return
+        for row in conn.execute(
+            "SELECT id, concept_id, concept_hints_json FROM code_problems"
+        ):
+            if row["concept_id"]:
+                continue
+            hints = json.loads(row["concept_hints_json"] or "[]")
+            match_id = _match_concept_id(concepts, hints)
+            if match_id is not None:
+                conn.execute(
+                    "UPDATE code_problems SET concept_id=? WHERE id=?",
+                    (match_id, row["id"]),
+                )
+
+    def _seed_math_formulas(self, conn: sqlite3.Connection) -> None:
+        from .math_bank import FORMULAS
+
+        now = utc_now()
+        for formula in FORMULAS:
+            conn.execute(
+                """
+                INSERT INTO math_formulas (
+                    slug, title, latex, spoken, intuition, key_phrases_json,
+                    blanks_json, terms_json, tags_json, concept_hints_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    title=excluded.title,
+                    latex=excluded.latex,
+                    spoken=excluded.spoken,
+                    intuition=excluded.intuition,
+                    key_phrases_json=excluded.key_phrases_json,
+                    blanks_json=excluded.blanks_json,
+                    terms_json=excluded.terms_json,
+                    tags_json=excluded.tags_json,
+                    concept_hints_json=excluded.concept_hints_json
+                """,
+                (
+                    formula["slug"],
+                    formula["title"],
+                    formula["latex"],
+                    formula["spoken"],
+                    formula.get("intuition", ""),
+                    json.dumps(formula.get("key_phrases", [])),
+                    json.dumps(formula.get("blanks", [])),
+                    json.dumps(formula.get("terms", [])),
+                    json.dumps(formula.get("tags", [])),
+                    json.dumps(formula.get("concept_hints", [])),
+                    now,
+                ),
+            )
+
+    def _relink_math_formulas(self, conn: sqlite3.Connection) -> None:
+        concepts = conn.execute("SELECT id, title FROM concepts").fetchall()
+        if not concepts:
+            return
+        for row in conn.execute("SELECT id, concept_id, concept_hints_json FROM math_formulas"):
+            if row["concept_id"]:
+                continue
+            hints = json.loads(row["concept_hints_json"] or "[]")
+            match_id = _match_concept_id(concepts, hints)
+            if match_id is not None:
+                conn.execute(
+                    "UPDATE math_formulas SET concept_id=? WHERE id=?",
+                    (match_id, row["id"]),
+                )
 
     def _migrate_legacy_cards(self, conn: sqlite3.Connection) -> None:
         if self._meta(conn, "legacy_cards_migrated") == "1":
@@ -672,11 +838,15 @@ class KnowledgeDB:
         with closing(self.connect()) as conn:
             return conn.execute(
                 """
-                SELECT c.*, t.slug AS topic_slug, COUNT(q.id) AS question_count
+                SELECT c.*, t.slug AS topic_slug,
+                    (SELECT COUNT(*) FROM questions q
+                     WHERE q.concept_id = c.id AND q.status = 'active') AS question_count,
+                    (SELECT COUNT(*) FROM code_problems p
+                     WHERE p.concept_id = c.id) AS code_count,
+                    (SELECT COUNT(*) FROM math_formulas m
+                     WHERE m.concept_id = c.id) AS math_count
                 FROM concepts c
                 JOIN topics t ON t.id = c.topic_id
-                LEFT JOIN questions q ON q.concept_id = c.id AND q.status='active'
-                GROUP BY c.id
                 ORDER BY t.slug, c.title
                 LIMIT ?
                 """,
@@ -696,6 +866,208 @@ class KnowledgeDB:
                 """,
                 (limit,),
             ).fetchall()
+
+    def list_code_problems(self, concept_id: int | None = None) -> list[sqlite3.Row]:
+        query = """
+            SELECT p.id, p.slug, p.title, p.prompt, p.starter, p.difficulty,
+                   p.tags_json, p.concept_id, p.timeout_seconds,
+                   c.title AS concept_title,
+                   (SELECT COUNT(*) FROM code_attempts a WHERE a.problem_id = p.id) AS attempts,
+                   (SELECT MAX(a.passed) FROM code_attempts a WHERE a.problem_id = p.id) AS ever_passed,
+                   (SELECT a.passed FROM code_attempts a WHERE a.problem_id = p.id
+                    ORDER BY a.ts DESC LIMIT 1) AS last_passed,
+                   (SELECT a.code FROM code_attempts a WHERE a.problem_id = p.id
+                    ORDER BY a.ts DESC LIMIT 1) AS last_code
+            FROM code_problems p
+            LEFT JOIN concepts c ON c.id = p.concept_id
+        """
+        params: list[Any] = []
+        if concept_id is not None:
+            query += " WHERE p.concept_id = ?"
+            params.append(concept_id)
+        query += " ORDER BY CASE p.difficulty WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, p.title"
+        with closing(self.connect()) as conn:
+            return conn.execute(query, params).fetchall()
+
+    def get_code_problem(self, problem_id: int, *, include_tests: bool = False) -> sqlite3.Row | None:
+        columns = "p.*, c.title AS concept_title" if include_tests else (
+            "p.id, p.slug, p.title, p.prompt, p.starter, p.difficulty, p.tags_json, "
+            "p.concept_id, p.timeout_seconds, c.title AS concept_title"
+        )
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                f"""
+                SELECT {columns}
+                FROM code_problems p
+                LEFT JOIN concepts c ON c.id = p.concept_id
+                WHERE p.id = ?
+                """,
+                (problem_id,),
+            ).fetchone()
+
+    def record_code_attempt(
+        self,
+        problem_id: int,
+        code: str,
+        passed: bool,
+        passed_count: int,
+        failed_count: int,
+        runtime_ms: int,
+        output: str,
+    ) -> int:
+        with closing(self.connect()) as conn, conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO code_attempts (
+                    problem_id, ts, passed, passed_count, failed_count, runtime_ms, code, output
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    problem_id,
+                    utc_now(),
+                    int(passed),
+                    passed_count,
+                    failed_count,
+                    runtime_ms,
+                    code,
+                    output[:4000],
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def due_code_problem_count(self) -> int:
+        """Drills linked to a concept that is due today."""
+
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM code_problems p
+                JOIN concepts c ON c.id = p.concept_id
+                WHERE c.due <= ?
+                """,
+                (date.today().isoformat(),),
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    def list_math_formulas(self, concept_id: int | None = None) -> list[sqlite3.Row]:
+        query = """
+            SELECT f.id, f.slug, f.title, f.latex, f.intuition, f.tags_json,
+                   f.concept_id, f.blanks_json, f.terms_json,
+                   c.title AS concept_title,
+                   (SELECT COUNT(*) FROM math_attempts a WHERE a.formula_id = f.id) AS attempts,
+                   (SELECT MAX(a.passed) FROM math_attempts a WHERE a.formula_id = f.id) AS ever_passed
+            FROM math_formulas f
+            LEFT JOIN concepts c ON c.id = f.concept_id
+        """
+        params: list[Any] = []
+        if concept_id is not None:
+            query += " WHERE f.concept_id = ?"
+            params.append(concept_id)
+        query += " ORDER BY f.title"
+        with closing(self.connect()) as conn:
+            return conn.execute(query, params).fetchall()
+
+    def get_math_formula(self, formula_id: int, *, include_answers: bool = False) -> sqlite3.Row | None:
+        columns = "f.*, c.title AS concept_title" if include_answers else (
+            "f.id, f.slug, f.title, f.latex, f.intuition, f.tags_json, f.concept_id, "
+            "f.blanks_json, f.terms_json, c.title AS concept_title"
+        )
+        with closing(self.connect()) as conn:
+            return conn.execute(
+                f"""
+                SELECT {columns}
+                FROM math_formulas f
+                LEFT JOIN concepts c ON c.id = f.concept_id
+                WHERE f.id = ?
+                """,
+                (formula_id,),
+            ).fetchone()
+
+    def add_math_formula(
+        self,
+        slug: str,
+        title: str,
+        latex: str,
+        spoken: str,
+        intuition: str = "",
+        key_phrases: list[str] | None = None,
+        blanks: list[dict[str, Any]] | None = None,
+        terms: list[dict[str, Any]] | None = None,
+        tags: list[str] | None = None,
+        concept_id: int | None = None,
+        concept_hints: list[str] | None = None,
+    ) -> int:
+        now = utc_now()
+        with closing(self.connect()) as conn, conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO math_formulas (
+                    slug, title, latex, spoken, intuition, key_phrases_json,
+                    blanks_json, terms_json, tags_json, concept_hints_json,
+                    concept_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(slug) DO UPDATE SET
+                    title=excluded.title,
+                    latex=excluded.latex,
+                    spoken=excluded.spoken,
+                    intuition=excluded.intuition,
+                    key_phrases_json=excluded.key_phrases_json,
+                    blanks_json=excluded.blanks_json,
+                    terms_json=excluded.terms_json,
+                    tags_json=excluded.tags_json,
+                    concept_id=COALESCE(excluded.concept_id, math_formulas.concept_id)
+                """,
+                (
+                    slug,
+                    title,
+                    latex,
+                    spoken,
+                    intuition,
+                    json.dumps(key_phrases or []),
+                    json.dumps(blanks or []),
+                    json.dumps(terms or []),
+                    json.dumps(tags or []),
+                    json.dumps(concept_hints or []),
+                    concept_id,
+                    now,
+                ),
+            )
+            if cursor.lastrowid:
+                return int(cursor.lastrowid)
+            row = conn.execute("SELECT id FROM math_formulas WHERE slug=?", (slug,)).fetchone()
+            return int(row["id"])
+
+    def record_math_attempt(
+        self,
+        formula_id: int,
+        mode: str,
+        passed: bool,
+        payload: dict[str, Any],
+        result: dict[str, Any],
+    ) -> int:
+        with closing(self.connect()) as conn, conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO math_attempts (formula_id, ts, mode, passed, payload_json, result_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (formula_id, utc_now(), mode, int(passed), json.dumps(payload), json.dumps(result)),
+            )
+            return int(cursor.lastrowid)
+
+    def due_math_formula_count(self) -> int:
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM math_formulas f
+                JOIN concepts c ON c.id = f.concept_id
+                WHERE c.due <= ?
+                """,
+                (date.today().isoformat(),),
+            ).fetchone()
+        return int(row["n"] or 0)
 
     # ------------------------------------------------------------------
     # Semantic retrieval (local vector index over chunks and concepts)
@@ -1006,6 +1378,14 @@ class KnowledgeDB:
                 (date.today().isoformat(),),
             ).fetchone()["n"]
             leech_count = conn.execute("SELECT COUNT(*) AS n FROM concepts WHERE leech=1").fetchone()["n"]
+            try:
+                code_count = conn.execute("SELECT COUNT(*) AS n FROM code_problems").fetchone()["n"]
+            except sqlite3.OperationalError:
+                code_count = 0
+            try:
+                math_count = conn.execute("SELECT COUNT(*) AS n FROM math_formulas").fetchone()["n"]
+            except sqlite3.OperationalError:
+                math_count = 0
         return {
             "concepts": concept_count,
             "questions": question_count,
@@ -1013,6 +1393,8 @@ class KnowledgeDB:
             "reviews": review_count,
             "due": due_count,
             "leeches": leech_count,
+            "code_problems": code_count,
+            "math_formulas": math_count,
         }
 
     def topic_mastery(self) -> dict[str, float]:
@@ -1038,7 +1420,7 @@ class KnowledgeDB:
                 ORDER BY confidence
                 """
             ).fetchall()
-        return {f"conf {row['confidence']}": float(row["accuracy"]) for row in rows}
+        return {str(int(row["confidence"])): float(row["accuracy"]) for row in rows}
 
     def weak_spots(self, limit: int = 10) -> list[sqlite3.Row]:
         with closing(self.connect()) as conn:
@@ -1052,7 +1434,7 @@ class KnowledgeDB:
                 JOIN topics t ON t.id = c.topic_id
                 LEFT JOIN reviews r ON r.concept_id = c.id
                 GROUP BY c.id
-                HAVING reviews > 0
+                HAVING reviews > 0 AND (c.leech = 1 OR c.mastery < 0.75 OR accuracy < 0.7)
                 ORDER BY c.leech DESC, accuracy ASC, overconfident_misses DESC, c.mastery ASC
                 LIMIT ?
                 """,
@@ -1316,6 +1698,71 @@ class KnowledgeDB:
             )
             return cursor.rowcount
 
+    def unified_search(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Keyword hits plus semantic neighbours, merged and de-duplicated.
+
+        FTS is exact; the vector index is for the case where the learner asks
+        in their own words ("why do early layers stop learning") rather than
+        the phrase that happens to be in the notes.
+        """
+
+        query = query.strip()
+        if not query:
+            return []
+
+        hits: dict[tuple[str, int], dict[str, Any]] = {}
+        for row in self.search(query, limit=limit):
+            key = (row["kind"], int(row["ref_id"]))
+            hits[key] = {
+                "kind": row["kind"],
+                "ref_id": int(row["ref_id"]),
+                "title": row["title"],
+                "snippet": str(row["snippet"] or "")[:400],
+                "via": "text",
+                "score": None,
+            }
+
+        try:
+            for chunk in self.semantic_chunks(query, k=limit):
+                if chunk["score"] < _SEMANTIC_FLOOR:
+                    continue
+                key = ("chunk", chunk["chunk_id"])
+                snippet = str(chunk["text"] or "")[:400]
+                previous = hits.get(key)
+                hits[key] = {
+                    "kind": "chunk",
+                    "ref_id": chunk["chunk_id"],
+                    "title": chunk["source_title"],
+                    "snippet": snippet if not previous else previous["snippet"],
+                    "via": "both" if previous else "semantic",
+                    "score": chunk["score"],
+                }
+            for concept, score in self.semantic_concepts(query, k=limit):
+                if score < _SEMANTIC_FLOOR:
+                    continue
+                key = ("concept", concept.id)
+                previous = hits.get(key)
+                hits[key] = {
+                    "kind": "concept",
+                    "ref_id": concept.id,
+                    "title": concept.title,
+                    "snippet": (previous["snippet"] if previous else concept.summary)[:400],
+                    "via": "both" if previous else "semantic",
+                    "score": score,
+                }
+        except Exception:
+            # A missing or empty embedding table must not take search down.
+            pass
+
+        ranked = sorted(
+            hits.values(),
+            key=lambda item: (
+                0 if item["via"] == "both" else 1 if item["via"] == "semantic" else 2,
+                -(item["score"] or 0.0),
+            ),
+        )
+        return ranked[:limit]
+
     def search(self, query: str, limit: int = 20) -> list[sqlite3.Row]:
         query = query.strip()
         if not query:
@@ -1449,6 +1896,18 @@ def slugify(value: str) -> str:
     return value or "general"
 
 
+def _match_concept_id(concepts: list[sqlite3.Row], hints: list[str]) -> int | None:
+    if not hints:
+        return None
+    lowered = [(int(row["id"]), str(row["title"]).lower()) for row in concepts]
+    for hint in hints:
+        needle = hint.lower()
+        for concept_id, title in lowered:
+            if needle in title:
+                return concept_id
+    return None
+
+
 def clean_label(value: str) -> str:
     value = re.sub(r"\s+", " ", value.strip())
     return value[:120] or "Untitled concept"
@@ -1464,9 +1923,24 @@ def infer_concept_title(question: str) -> str:
     return clean_label(" ".join(words[:10]))
 
 
+# MiniLM cosine for a related passage is typically 0.3–0.6. Unrelated noise
+# clusters around 0.20–0.27, especially if the query contains a generic word
+# like "concept". Drop semantic-only neighbours under this so junk queries
+# do not fill the results with the nearest random chunks.
+_SEMANTIC_FLOOR = 0.30
+
+_FTS_STOP = {
+    "the", "and", "for", "with", "from", "that", "this", "into", "your",
+    "what", "when", "where", "which", "such", "are", "was", "not",
+}
+
+
 def fts_query(query: str) -> str:
-    terms = [term for term in re.findall(r"[A-Za-z0-9_]+", query) if term]
-    return " OR ".join(terms) if terms else query
+    tokens = re.findall(r"[A-Za-z0-9_]+", query)
+    terms = [term for term in tokens if len(term) >= 3 and term.lower() not in _FTS_STOP]
+    if not terms:
+        terms = tokens
+    return " AND ".join(terms) if terms else query
 
 
 def utc_now() -> str:

@@ -8,7 +8,7 @@ import {
 } from "../lib/api";
 import { Bar, Button, Kbd, Pill, Spinner, cx } from "../components/ui";
 
-const LETTERS = "ABCDE";
+const LETTERS = "ABCDEF";
 const CONFIDENCE = [
   { level: 1, label: "guessing" },
   { level: 2, label: "shaky" },
@@ -66,6 +66,14 @@ export function Study({
       requestAnimationFrame(() => answerRef.current?.focus());
     }
   }, [index, question?.written]);
+
+  useEffect(() => {
+    if (phase === "answering" || !grade) return;
+    document.getElementById("study-feedback")?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  }, [phase, grade]);
 
   const finish = useCallback(
     async (wasCorrect: boolean, graded: Grade | null, text: string) => {
@@ -129,6 +137,14 @@ export function Study({
   const chooseOption = useCallback(
     async (optionIndex: number) => {
       if (phase !== "answering") return;
+      if (question.question_type === "multi_select") {
+        setSelected((current) =>
+          current.includes(optionIndex)
+            ? current.filter((item) => item !== optionIndex)
+            : [...current, optionIndex].sort((a, b) => a - b),
+        );
+        return;
+      }
       const revealed = await api.reveal(question.id);
       setReveal(revealed);
       setSelected([optionIndex]);
@@ -136,6 +152,21 @@ export function Study({
     },
     [finish, phase, question],
   );
+
+  const submitSelection = useCallback(async () => {
+    if (phase !== "answering" || !selected.length) return;
+    const revealed = await api.reveal(question.id);
+    setReveal(revealed);
+    const expected = revealed.answer_indices.length
+      ? revealed.answer_indices
+      : revealed.answer_index != null
+        ? [revealed.answer_index]
+        : [];
+    const want = new Set(expected);
+    const wasCorrect =
+      selected.length === want.size && selected.every((item) => want.has(item));
+    await finish(wasCorrect, null, selected.map((item) => LETTERS[item]).join(""));
+  }, [finish, phase, question, selected]);
 
   const advance = useCallback(() => {
     if (index + 1 >= items.length) {
@@ -154,9 +185,11 @@ export function Study({
     question,
     grading,
     mustProbe,
+    probe,
     setConfidence,
     chooseOption,
     submitWritten,
+    submitSelection,
     advance,
     startProbe: () => setPhase("probing"),
     onExit,
@@ -244,6 +277,20 @@ export function Study({
               onChoose={chooseOption}
             />
           )}
+          {phase === "answering" && question.question_type === "multi_select" && (
+            <div className="mt-3 flex items-center justify-between">
+              <p className="text-xs text-faint">
+                Letters toggle · <Kbd>Enter</Kbd> to submit
+              </p>
+              <Button
+                variant="primary"
+                onClick={() => void submitSelection()}
+                disabled={!selected.length}
+              >
+                Submit selection
+              </Button>
+            </div>
+          )}
         </div>
 
         {phase !== "answering" && grade && (
@@ -267,15 +314,29 @@ export function Study({
                 <>
                   Answer the probe before moving on · <Kbd>P</Kbd>
                 </>
+              ) : phase === "probing" ? (
+                <>
+                  <Kbd>⌘</Kbd> <Kbd>↵</Kbd> after the probe
+                </>
               ) : (
                 <>
                   <Kbd>Enter</Kbd> to continue
                 </>
               )}
             </p>
-            <Button variant="primary" onClick={advance}>
-              {index + 1 >= items.length ? "Finish round" : "Next question"}
-            </Button>
+            {mustProbe && phase === "graded" ? (
+              <Button variant="primary" onClick={() => setPhase("probing")}>
+                Answer the probe
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                onClick={advance}
+                disabled={phase === "probing" && !probe.trim()}
+              >
+                {index + 1 >= items.length ? "Finish round" : "Next question"}
+              </Button>
+            )}
           </div>
         </footer>
       )}
@@ -332,8 +393,18 @@ function Options({
   return (
     <ul className="space-y-2">
       {question.options.map((option, optionIndex) => {
-        const isAnswer = reveal?.answer_index === optionIndex;
+        const answers = new Set(
+          reveal
+            ? reveal.answer_indices.length
+              ? reveal.answer_indices
+              : reveal.answer_index != null
+                ? [reveal.answer_index]
+                : []
+            : [],
+        );
+        const isAnswer = Boolean(reveal) && answers.has(optionIndex);
         const isPicked = selected.includes(optionIndex);
+        const pickedWrong = Boolean(reveal) && isPicked && !isAnswer;
         return (
           <li key={option}>
             <button
@@ -344,9 +415,11 @@ function Options({
                 "disabled:cursor-default",
                 isAnswer
                   ? "border-correct bg-correct/10"
-                  : isPicked
+                  : pickedWrong
                     ? "border-wrong bg-wrong/10"
-                    : "border-border bg-surface enabled:hover:border-border-strong enabled:hover:bg-raised",
+                    : isPicked
+                      ? "border-accent bg-accent-soft"
+                      : "border-border bg-surface enabled:hover:border-border-strong enabled:hover:bg-raised",
               )}
             >
               <span
@@ -354,9 +427,11 @@ function Options({
                   "mt-px flex h-5 w-5 shrink-0 items-center justify-center rounded border font-mono text-[11px]",
                   isAnswer
                     ? "border-correct text-correct"
-                    : isPicked
+                    : pickedWrong
                       ? "border-wrong text-wrong"
-                      : "border-border text-faint",
+                      : isPicked
+                        ? "border-accent text-text"
+                        : "border-border text-faint",
                 )}
               >
                 {LETTERS[optionIndex]}
@@ -442,7 +517,10 @@ function Feedback({
         : "wrong";
 
   return (
-    <div className={cx("mt-8 space-y-4", correct ? "animate-correct" : "animate-rise")}>
+    <div
+      id="study-feedback"
+      className={cx("mt-8 space-y-4", correct ? "animate-correct" : "animate-rise")}
+    >
       <div className="flex items-center gap-3">
         <span
           className="text-lg font-semibold capitalize"
@@ -542,16 +620,19 @@ function formatCritique(grade: Grade): string {
  * All study keyboard handling in one place.
  *
  * The whole loop is reachable without the mouse: digits set confidence, letters
- * pick options, Cmd+Enter submits, Enter advances, Esc leaves.
+ * pick options, Cmd+Enter submits written answers, Enter submits a multi-select
+ * or advances, Esc leaves.
  */
 function useKeyboard({
   phase,
   question,
   grading,
   mustProbe,
+  probe,
   setConfidence,
   chooseOption,
   submitWritten,
+  submitSelection,
   advance,
   startProbe,
   onExit,
@@ -560,9 +641,11 @@ function useKeyboard({
   question: Question | undefined;
   grading: boolean;
   mustProbe: boolean;
+  probe: string;
   setConfidence: (level: number) => void;
   chooseOption: (index: number) => void;
   submitWritten: () => void;
+  submitSelection: () => void;
   advance: () => void;
   startProbe: () => void;
   onExit: () => void;
@@ -587,6 +670,12 @@ function useKeyboard({
         }
         if (typing || grading) return;
 
+        if (event.key === "Enter" && question.question_type === "multi_select") {
+          event.preventDefault();
+          submitSelection();
+          return;
+        }
+
         if (event.key >= "1" && event.key <= "5") {
           event.preventDefault();
           setConfidence(Number(event.key));
@@ -600,12 +689,27 @@ function useKeyboard({
         return;
       }
 
-      if (typing) return;
-      if (event.key.toLowerCase() === "p" && mustProbe) {
-        event.preventDefault();
-        startProbe();
+      if (phase === "probing") {
+        if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && probe.trim()) {
+          event.preventDefault();
+          advance();
+        }
         return;
       }
+
+      if (mustProbe) {
+        if (
+          event.key.toLowerCase() === "p" ||
+          event.key === "Enter" ||
+          event.key === " "
+        ) {
+          event.preventDefault();
+          startProbe();
+        }
+        return;
+      }
+
+      if (typing) return;
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
         advance();
@@ -621,8 +725,10 @@ function useKeyboard({
     mustProbe,
     onExit,
     phase,
+    probe,
     question,
     setConfidence,
+    submitSelection,
     startProbe,
     submitWritten,
   ]);

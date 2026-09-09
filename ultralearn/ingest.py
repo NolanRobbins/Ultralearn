@@ -20,7 +20,7 @@ from typing import Any
 from .db import KnowledgeDB, slugify
 from .generation import GENERATION_BATCH_SIZE, save_generated_questions
 from .jobs import ProgressReporter, register
-from .loaders import UnsupportedSourceError, extract_file, fetch_url
+from .loaders import UnsupportedSourceError, extract_file, fetch_url, iter_supported_files
 from .providers import Provider, ProviderError
 
 #: Concepts pulled from one source in a single pass. Enough for a chapter
@@ -124,44 +124,131 @@ def run_ingest(
         return result
     result["concepts"] = len(concepts)
 
-    total_questions = 0
-    total_duplicates = 0
-    # Generate per concept so a failure costs one concept, not the whole source,
-    # and so each question is anchored to a specific idea rather than a page.
-    for index, concept in enumerate(concepts):
-        fraction = 0.3 + 0.65 * (index / max(1, len(concepts)))
-        report(fraction, f"Writing questions: {concept['title']}")
-        context = _context_for(document.text, concept)
-        try:
-            generated = provider.generate_questions(
-                text=context,
-                n=min(QUESTIONS_PER_CONCEPT, GENERATION_BATCH_SIZE),
-                topic_slug=topic_slug,
-                source_title=title,
-                concept_title=concept["title"],
-            )
-        except ProviderError:
-            # One unlucky concept must not sink an otherwise good ingest.
-            continue
-        # Pin every question to the concept we indexed, so the generator cannot
-        # quietly invent a parallel set of concept names for the same material.
-        anchored = [
-            replace(
-                question,
-                concept_title=concept["title"],
-                concept_summary=concept["summary"] or question.concept_summary,
-                topic_slug=topic_slug,
-            )
-            for question in generated
-        ]
-        saved = save_generated_questions(db, anchored, source_id=source_id)
-        total_questions += saved.saved
-        total_duplicates += saved.duplicates
-
-    result["questions"] = total_questions
-    result["duplicates"] = total_duplicates
-    report(1.0, f"{total_questions} questions across {len(concepts)} concepts")
+    saved_questions, duplicates = _write_questions(
+        db, provider, document.text, concepts, topic_slug, title, source_id, report
+    )
+    result["questions"] = saved_questions
+    result["duplicates"] = duplicates
+    report(1.0, f"{saved_questions} questions across {len(concepts)} concepts")
     return result
+
+
+@register("ingest_folder")
+def run_ingest_folder(
+    db: KnowledgeDB,
+    provider: Provider,
+    payload: dict[str, Any],
+    report: ProgressReporter,
+) -> dict[str, Any]:
+    """Ingest every supported file in a dropped folder, one source each."""
+
+    paths = iter_supported_files(payload["folder"])
+    if not paths:
+        raise UnsupportedSourceError(
+            "That folder had no PDF, Word, EPUB, Markdown, HTML, or text files."
+        )
+
+    totals = {"files": 0, "concepts": 0, "questions": 0, "duplicates": 0, "failed": 0}
+    for index, path in enumerate(paths):
+        report(index / len(paths), f"Reading {path.name}")
+        try:
+            child = run_ingest(
+                db,
+                provider,
+                {
+                    "raw": path.read_bytes().hex(),
+                    "filename": path.name,
+                    "generate": payload.get("generate", True),
+                },
+                report,
+            )
+        except (UnsupportedSourceError, ProviderError):
+            totals["failed"] += 1
+            continue
+        totals["files"] += 1
+        totals["concepts"] += int(child.get("concepts") or 0)
+        totals["questions"] += int(child.get("questions") or 0)
+        totals["duplicates"] += int(child.get("duplicates") or 0)
+    report(1.0, f"{totals['files']} files from the folder")
+    return totals
+
+
+@register("generate")
+def run_generate(
+    db: KnowledgeDB,
+    provider: Provider,
+    payload: dict[str, Any],
+    report: ProgressReporter,
+) -> dict[str, Any]:
+    """Write more questions from a source already in the library."""
+
+    source_id = int(payload["source_id"])
+    title = payload.get("title") or f"Source {source_id}"
+    text = db.source_text(source_id)
+    if not text.strip():
+        raise UnsupportedSourceError("That source has no stored text to generate from.")
+
+    report(0.2, f"Finding concepts in {title}")
+    topic_slug, concepts = extract_concepts(provider, text, db)
+    if not concepts:
+        return {"source_id": source_id, "concepts": 0, "questions": 0, "duplicates": 0}
+
+    questions, duplicates = _write_questions(
+        db, provider, text, concepts, topic_slug, title, source_id, report
+    )
+    report(1.0, f"{questions} new questions")
+    return {
+        "source_id": source_id,
+        "concepts": len(concepts),
+        "questions": questions,
+        "duplicates": duplicates,
+    }
+
+
+@register("generate_focus")
+def run_generate_focus(
+    db: KnowledgeDB,
+    provider: Provider,
+    payload: dict[str, Any],
+    report: ProgressReporter,
+) -> dict[str, Any]:
+    """Write questions from the passages closest to a Focus query.
+
+    This is how overlapping sources contribute: the vector index pulls the
+    relevant chunks wherever they live, then generation runs against that mix.
+    """
+
+    query = str(payload.get("query") or "").strip()
+    if not query:
+        raise UnsupportedSourceError("Nothing to focus on.")
+
+    report(0.15, f"Finding passages about: {query}")
+    matches = db.semantic_chunks(query, k=6)
+    if not matches:
+        raise UnsupportedSourceError("Nothing in the library is close to that yet. Add some material first.")
+
+    text = "\n\n".join(match["text"] for match in matches)
+    # Attribute new questions to the source that contributed the closest chunk
+    # so they still trace back to real material.
+    source_id = int(matches[0]["source_id"])
+    title = str(matches[0]["source_title"])
+
+    report(0.3, "Finding the concepts worth learning")
+    topic_slug, concepts = extract_concepts(provider, text, db)
+    if not concepts:
+        return {"concepts": 0, "questions": 0, "duplicates": 0, "query": query}
+
+    questions, duplicates = _write_questions(
+        db, provider, text, concepts, topic_slug, title, source_id, report
+    )
+    report(1.0, f"{questions} questions on {query}")
+    return {
+        "query": query,
+        "concepts": len(concepts),
+        "questions": questions,
+        "duplicates": duplicates,
+        "source_id": source_id,
+    }
 
 
 @register("coaching")
@@ -234,6 +321,49 @@ def extract_concepts(
         if len(concepts) >= MAX_CONCEPTS_PER_SOURCE:
             break
     return topic_slug or "general", concepts
+
+
+def _write_questions(
+    db: KnowledgeDB,
+    provider: Provider,
+    text: str,
+    concepts: list[dict[str, str]],
+    topic_slug: str,
+    title: str,
+    source_id: int,
+    report: ProgressReporter,
+) -> tuple[int, int]:
+    """Generate and save questions for each concept. One failure does not sink the rest."""
+
+    total_questions = 0
+    total_duplicates = 0
+    for index, concept in enumerate(concepts):
+        fraction = 0.3 + 0.65 * (index / max(1, len(concepts)))
+        report(fraction, f"Writing questions: {concept['title']}")
+        context = _context_for(text, concept)
+        try:
+            generated = provider.generate_questions(
+                text=context,
+                n=min(QUESTIONS_PER_CONCEPT, GENERATION_BATCH_SIZE),
+                topic_slug=topic_slug,
+                source_title=title,
+                concept_title=concept["title"],
+            )
+        except ProviderError:
+            continue
+        anchored = [
+            replace(
+                question,
+                concept_title=concept["title"],
+                concept_summary=concept["summary"] or question.concept_summary,
+                topic_slug=topic_slug,
+            )
+            for question in generated
+        ]
+        saved = save_generated_questions(db, anchored, source_id=source_id)
+        total_questions += saved.saved
+        total_duplicates += saved.duplicates
+    return total_questions, total_duplicates
 
 
 def _load(payload: dict[str, Any]):

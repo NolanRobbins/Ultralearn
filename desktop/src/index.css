@@ -95,6 +95,10 @@
       bg-raised px-1.5 font-mono text-[11px] leading-none text-faint;
   }
 
+  .font-read {
+    font-family: var(--font-read);
+  }
+
   /* Answer feedback should register physically, not just chromatically. */
   @keyframes answer-correct {
     0% {
@@ -143,6 +147,19 @@
   }
   .animate-rise {
     animation: rise 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .katex {
+    color: var(--color-text);
+  }
+  .katex-display {
+    margin: 0.4em 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .cm-editor {
+    height: 100%;
+    background: transparent;
   }
 
   @media (prefers-reduced-motion: reduce) {

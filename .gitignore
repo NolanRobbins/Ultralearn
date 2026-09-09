@@ -19,3 +19,16 @@ desktop/.vite/
 desktop/src-tauri/target/
 
 .DS_Store
+
+# Local UI dumps and Playwright shots. Screenshots can capture a live
+# loopback token in the address bar, so this folder stays off git.
+.ui-test/
+
+# Secrets. API keys live in ~/.config/ultralearn/env (mode 600) or a local
+# .env next to the repo — never in the tree.
+.env
+.env.*
+!.env.example
+credentials.json
+secrets.json
+*.pem

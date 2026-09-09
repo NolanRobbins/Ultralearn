@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import socket
+import sys
 import threading
 import time
 import webbrowser
@@ -18,6 +19,11 @@ import uvicorn
 
 from .api import create_app
 from .config import AppConfig
+
+
+def _announce(message: str) -> None:
+    # stderr so the URL still appears when stdout is fully buffered (no TTY).
+    print(message, file=sys.stderr, flush=True)
 
 
 def free_port() -> int:
@@ -80,7 +86,7 @@ def main() -> None:
     server.start()
 
     if args.browser:
-        print(f"Ultralearn is running at {server.url}")
+        _announce(f"Ultralearn is running at {server.url}")
         webbrowser.open(server.url)
         try:
             while True:
@@ -131,8 +137,8 @@ def serve() -> None:
 
     server = Server(AppConfig.from_env(), args.port)
     server.start()
-    print(f"Ultralearn API on http://127.0.0.1:{args.port}")
-    print(f"Token: {server.token}")
+    _announce(f"Ultralearn API on http://127.0.0.1:{args.port}")
+    _announce(f"Token: {server.token}")
     try:
         while True:
             time.sleep(1)

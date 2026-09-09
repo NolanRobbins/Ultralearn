@@ -7,9 +7,11 @@ only for the address the learner explicitly dropped in.
 from __future__ import annotations
 
 import re
+import zipfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 
 @dataclass(frozen=True)
@@ -39,7 +41,19 @@ class UnsupportedSourceError(RuntimeError):
 
 
 #: File extensions that can be ingested directly.
-SUPPORTED_SUFFIXES = {".pdf", ".epub", ".md", ".markdown", ".txt", ".rst", ".html", ".htm"}
+SUPPORTED_SUFFIXES = {
+    ".pdf",
+    ".epub",
+    ".docx",
+    ".md",
+    ".markdown",
+    ".txt",
+    ".rst",
+    ".html",
+    ".htm",
+}
+
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 def extract_pdf_text(data: bytes) -> PDFExtractionResult:
@@ -133,6 +147,40 @@ def extract_epub_text(data: bytes) -> ExtractedDocument:
     return ExtractedDocument(text=text, title=title, author=author, source_type="book")
 
 
+def extract_docx_text(data: bytes) -> ExtractedDocument:
+    """Extract readable paragraphs from a .docx (Office Open XML) file.
+
+    Word files are a zip of XML. We only need ``word/document.xml`` — no extra
+    dependency, and it works for the notes and chapter exports learners actually
+    drop in.
+    """
+
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            try:
+                xml = archive.read("word/document.xml")
+            except KeyError as exc:
+                raise UnsupportedSourceError("This Word file has no document body.") from exc
+    except zipfile.BadZipFile as exc:
+        raise UnsupportedSourceError("This does not look like a Word (.docx) file.") from exc
+
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError as exc:
+        raise UnsupportedSourceError("This Word file could not be parsed.") from exc
+
+    paragraphs: list[str] = []
+    for paragraph in root.iter(f"{_W_NS}p"):
+        pieces = [node.text or "" for node in paragraph.iter(f"{_W_NS}t")]
+        line = "".join(pieces).strip()
+        if line:
+            paragraphs.append(line)
+    text = "\n\n".join(paragraphs).strip()
+    if not text:
+        raise UnsupportedSourceError("No readable text was found in this Word file.")
+    return ExtractedDocument(text=text, source_type="note")
+
+
 def html_to_text(markup: str) -> str:
     """Reduce HTML to readable prose, dropping chrome, scripts, and styling."""
 
@@ -153,6 +201,29 @@ def html_to_text(markup: str) -> str:
     return "\n".join(line for line in lines if line)
 
 
+def iter_supported_files(folder: str | Path, limit: int = 200) -> list[Path]:
+    """Files in a dropped folder that Ultralearn can actually read.
+
+    Nested directories are included; hidden files and unsupported types are not,
+    so a notes folder full of images does not become a pile of failed jobs.
+    """
+
+    root = Path(folder)
+    if not root.is_dir():
+        raise UnsupportedSourceError(f"{folder} is not a folder.")
+    found: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name.startswith("."):
+            continue
+        if path.suffix.lower() in SUPPORTED_SUFFIXES:
+            found.append(path)
+            if len(found) >= limit:
+                break
+    return found
+
+
 def extract_file(filename: str, data: bytes) -> ExtractedDocument:
     """Load any supported dropped file into normalised text."""
 
@@ -171,6 +242,11 @@ def extract_file(filename: str, data: bytes) -> ExtractedDocument:
             title=document.title or stem,
             author=document.author,
             source_type="book",
+        )
+    if suffix == ".docx":
+        document = extract_docx_text(data)
+        return ExtractedDocument(
+            text=document.text, title=document.title or stem, source_type="book"
         )
     if suffix in {".html", ".htm"}:
         markup = data.decode("utf-8", errors="replace")

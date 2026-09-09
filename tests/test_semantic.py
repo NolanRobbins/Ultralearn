@@ -39,6 +39,44 @@ def test_semantic_concepts_rank_related_concept_first(tmp_path):
     assert matches[0][0].title == "Backprop chain rule"
 
 
+def test_unified_search_merges_keyword_and_semantic_hits(tmp_path):
+    db = make_db(tmp_path)
+    db.find_or_create_concept("Pot odds", "Price of a call vs pot size.", "poker")
+    source_id = db.add_source("note", "Poker basics")
+    db.add_content(source_id, "Pot odds compare the price of a call to the size of the pot.")
+
+    hits = db.unified_search("price of a call")
+    kinds = {hit["kind"] for hit in hits}
+    assert "concept" in kinds
+    assert "chunk" in kinds
+    # The exact phrase is in the notes, so at least one hit should be keyword-backed.
+    assert any(hit["via"] in {"text", "both"} for hit in hits)
+
+
+def test_unified_search_drops_unrelated_queries(tmp_path):
+    db = make_db(tmp_path)
+    db.find_or_create_concept("Pot odds", "Price of a call vs pot size.", "poker")
+    source_id = db.add_source("note", "Poker basics")
+    db.add_content(source_id, "Pot odds compare the price of a call to the size of the pot.")
+
+    assert db.unified_search("zzzzqwerty-no-such-concept") == []
+
+
+def test_semantic_floor_rejects_weak_neighbours():
+    from ultralearn.db import _SEMANTIC_FLOOR
+
+    # MiniLM scores leftover generic words like "concept" around 0.25–0.27.
+    assert _SEMANTIC_FLOOR >= 0.30
+
+
+def test_fts_query_requires_every_meaningful_term():
+    from ultralearn.db import fts_query
+
+    assert fts_query("sensor fusion") == "sensor AND fusion"
+    assert "OR" not in fts_query("zzzzqwerty-no-such-concept")
+    assert "zzzzqwerty" in fts_query("zzzzqwerty-no-such-concept")
+
+
 def test_best_chunk_for_text_picks_matching_passage(tmp_path):
     db = make_db(tmp_path)
     source_id = db.add_source("note", "Mixed notes")

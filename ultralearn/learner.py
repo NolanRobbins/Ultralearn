@@ -58,3 +58,26 @@ def build_session(db: KnowledgeDB, limit: int = 10) -> list[SessionItem]:
     )
     items.extend(SessionItem(concept=concept, practice=True) for concept in extra)
     return items
+
+
+def build_focus_session(db: KnowledgeDB, query: str, limit: int = 10) -> list[SessionItem]:
+    """A round built from concepts closest to what the learner asked to work on.
+
+    Practice, not due: choosing to drill a topic must not pull its SM-2 interval
+    forward the way a scheduled review does.
+    """
+
+    query = query.strip()
+    if not query:
+        return []
+    matches = db.semantic_concepts(query, k=limit * 2)
+    items: list[SessionItem] = []
+    seen: set[int] = set()
+    for concept, _score in matches:
+        if concept.id in seen:
+            continue
+        seen.add(concept.id)
+        items.append(SessionItem(concept=concept, practice=True))
+        if len(items) >= limit:
+            break
+    return items

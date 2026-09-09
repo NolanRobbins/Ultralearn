@@ -326,7 +326,7 @@ class ClaudeCodeProvider(PromptProvider):
     def available(self) -> bool:
         return shutil.which(self.executable) is not None
 
-    def check_auth(self, timeout_seconds: int = 25) -> tuple[bool, str]:
+    def check_auth(self, timeout_seconds: int = 8) -> tuple[bool, str]:
         """Cheaply establish whether the CLI is logged in.
 
         An expired token makes the CLI retry the 401 internally for minutes before
@@ -588,11 +588,123 @@ class OllamaProvider(PromptProvider):
         return data.get("response", "")
 
 
+_CURSOR_AUTH_HELP = (
+    "Cursor needs a CURSOR_API_KEY. Create one at https://cursor.com/dashboard/integrations "
+    "and export it in this shell. Logging into the Cursor IDE is not enough — the SDK cannot "
+    "reuse that session."
+)
+
+_CURSOR_MODELS = (
+    ("grok-4.6", "Grok 4.6"),
+    ("composer-2.5", "Composer 2.5"),
+    ("auto", "Auto"),
+)
+CURSOR_MODELS = _CURSOR_MODELS
+
+
+@functools.lru_cache(maxsize=1)
+def _cursor_scratch_dir() -> str:
+    path = Path(tempfile.gettempdir()) / "ultralearn-cursor-scratch"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+class CursorProvider(PromptProvider):
+    """Cursor SDK provider: Grok, Composer, and Auto, billed to a Cursor API key.
+
+    This is an agent runtime, not a raw chat-completions API. Tools are disabled
+    so a generation or grading call can only return text — it must not edit the
+    library or browse the web. The working directory is an empty scratch folder
+    so project rules never leak into study prompts.
+    """
+
+    name = "cursor"
+
+    def __init__(
+        self,
+        model: str = "grok-4.6",
+        api_key: str | None = None,
+        timeout_seconds: int = 300,
+    ) -> None:
+        self.model = model or "grok-4.6"
+        self.api_key = (api_key or os.environ.get("CURSOR_API_KEY") or "").strip()
+        self.timeout_seconds = timeout_seconds
+
+    def available(self) -> bool:
+        if not self.api_key:
+            return False
+        try:
+            import cursor_sdk  # noqa: F401
+        except Exception:
+            return False
+        return True
+
+    def check_auth(self) -> tuple[bool, str]:
+        if not self.api_key:
+            return False, _CURSOR_AUTH_HELP
+        try:
+            from cursor_sdk import Cursor
+        except Exception:
+            return False, "Install the cursor extra: uv sync --extra cursor"
+        try:
+            Cursor.me(api_key=self.api_key)
+        except Exception as exc:
+            return False, f"Cursor rejected the API key: {exc}"
+        return True, f"Cursor is ready ({self.model})."
+
+    def _complete(self, prompt: str, schema: dict[str, Any] | None = None) -> str:
+        if not self.api_key:
+            raise ProviderAuthError(_CURSOR_AUTH_HELP)
+        try:
+            from cursor_sdk import Agent, AgentOptions, CursorAgentError, LocalAgentOptions
+        except Exception as exc:
+            raise ProviderError("Install the cursor extra: uv sync --extra cursor") from exc
+
+        if schema is not None:
+            prompt = (
+                prompt
+                + "\n\nReturn ONLY valid JSON matching the requested schema. "
+                "No markdown fences and no prose."
+            )
+
+        try:
+            result = Agent.prompt(
+                prompt,
+                AgentOptions(
+                    api_key=self.api_key,
+                    model=self.model,
+                    tools=[],
+                    local=LocalAgentOptions(cwd=_cursor_scratch_dir()),
+                ),
+            )
+        except CursorAgentError as exc:
+            message = str(exc)
+            if any(marker in message.lower() for marker in _AUTH_ERROR_MARKERS):
+                raise ProviderAuthError(_CURSOR_AUTH_HELP) from exc
+            raise ProviderError(f"Cursor agent failed to start: {message[:800]}") from exc
+
+        if getattr(result, "status", None) == "error":
+            raise ProviderError("Cursor agent run failed.")
+        text = str(getattr(result, "result", None) or "").strip()
+        if not text:
+            raise ProviderError("Cursor returned an empty response.")
+        usage = getattr(result, "usage", None)
+        self.last_usage = {
+            "provider": self.name,
+            "model": self.model,
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+        }
+        return text
+
+
 def build_provider(
     name: str,
     config: AppConfig,
     anthropic_key: str = "",
     openai_key: str = "",
+    cursor_key: str = "",
+    cursor_model: str = "",
 ) -> Provider:
     normalized = (name or "claude_code").strip().lower()
     if normalized == "claude_code":
@@ -606,6 +718,12 @@ def build_provider(
         return AnthropicProvider(config.model, anthropic_key or None, config.provider_timeout_seconds)
     if normalized == "openai":
         return OpenAIProvider(config.model, openai_key or None, config.provider_timeout_seconds)
+    if normalized == "cursor":
+        return CursorProvider(
+            model=cursor_model or config.cursor_model,
+            api_key=cursor_key or None,
+            timeout_seconds=config.provider_timeout_seconds,
+        )
     if normalized == "ollama":
         return OllamaProvider(config.ollama_url, config.ollama_model, config.provider_timeout_seconds)
     return ManualProvider()

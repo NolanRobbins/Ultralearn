@@ -99,6 +99,10 @@ class TodayResponse(BaseModel):
     reviewed_today: int
     estimated_minutes: int
     recent_days: list[dict[str, Any]]
+    code_problems: int = 0
+    due_code: int = 0
+    math_formulas: int = 0
+    due_math: int = 0
 
 
 class IngestRequest(BaseModel):
@@ -107,6 +111,7 @@ class IngestRequest(BaseModel):
     title: str = ""
     source_type: str = "note"
     topic_slug: str = ""
+    folder: str = ""
     #: Generate questions after saving. Off means "just file the material".
     generate: bool = True
 
@@ -132,6 +137,8 @@ class ConceptOut(BaseModel):
     due: str
     leech: bool
     question_count: int
+    code_count: int = 0
+    math_count: int = 0
 
 
 class SourceOut(BaseModel):
@@ -148,3 +155,90 @@ class SearchHit(BaseModel):
     ref_id: int
     title: str
     snippet: str
+    via: str = "text"
+    score: float | None = None
+
+
+class CodeProblemOut(BaseModel):
+    id: int
+    slug: str
+    title: str
+    prompt: str
+    starter: str
+    difficulty: str
+    tags: list[str]
+    concept_id: int | None = None
+    concept_title: str | None = None
+    timeout_seconds: int = 8
+    attempts: int = 0
+    ever_passed: bool = False
+    last_passed: bool | None = None
+    last_code: str | None = None
+
+
+class CodeRunRequest(BaseModel):
+    problem_id: int
+    code: str
+
+
+class CodeCheckOut(BaseModel):
+    name: str
+    ok: bool
+    error: str = ""
+
+
+class CodeRunResponse(BaseModel):
+    passed: bool
+    checks: list[CodeCheckOut]
+    stdout: str = ""
+    stderr: str = ""
+    runtime_ms: int = 0
+    timed_out: bool = False
+    error: str = ""
+
+
+class MathBlankOut(BaseModel):
+    id: str
+    prompt: str
+
+
+class MathTermOut(BaseModel):
+    symbol: str
+    name: str
+
+
+class MathFormulaOut(BaseModel):
+    id: int
+    slug: str
+    title: str
+    latex: str
+    intuition: str = ""
+    tags: list[str] = Field(default_factory=list)
+    concept_id: int | None = None
+    concept_title: str | None = None
+    blanks: list[MathBlankOut] = Field(default_factory=list)
+    terms: list[MathTermOut] = Field(default_factory=list)
+    attempts: int = 0
+    ever_passed: bool = False
+
+
+class MathGradeRequest(BaseModel):
+    formula_id: int
+    mode: Literal["speak", "fill", "why"]
+    spoken: str = ""
+    blanks: dict[str, str] = Field(default_factory=dict)
+    term_symbol: str = ""
+    why: str = ""
+
+
+class MathGradeResponse(BaseModel):
+    passed: bool
+    verdict: str
+    score: float
+    hits: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    spoken: str = ""
+    intuition: str = ""
+    blank_results: list[dict[str, Any]] = Field(default_factory=list)
+    term_why: str = ""
+    fix: str = ""

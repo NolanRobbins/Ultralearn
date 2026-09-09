@@ -180,6 +180,10 @@ export function Progress() {
   );
 }
 
+function calibrationValue(data: Record<string, number>, level: string) {
+  return data[level] ?? data[`conf ${level}`];
+}
+
 function Calibration({ data }: { data: Record<string, number> }) {
   const levels = ["1", "2", "3", "4", "5"];
   const labels: Record<string, string> = {
@@ -189,7 +193,7 @@ function Calibration({ data }: { data: Record<string, number> }) {
     "4": "sure",
     "5": "certain",
   };
-  const hasData = levels.some((level) => data[level] !== undefined);
+  const hasData = levels.some((level) => calibrationValue(data, level) !== undefined);
   if (!hasData) {
     return (
       <div className="mt-3">
@@ -201,7 +205,7 @@ function Calibration({ data }: { data: Record<string, number> }) {
   return (
     <div className="mt-3 space-y-3">
       {levels.map((level) => {
-        const accuracy = data[level];
+        const accuracy = calibrationValue(data, level);
         if (accuracy === undefined) return null;
         // Confidence 4-5 means "I am sure"; being wrong there is the illusion of
         // knowing, so it is called out rather than shown as a neutral bar.

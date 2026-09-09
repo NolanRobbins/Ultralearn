@@ -120,6 +120,10 @@ export interface Today {
   reviewed_today: number;
   estimated_minutes: number;
   recent_days: DayActivity[];
+  code_problems?: number;
+  due_code?: number;
+  math_formulas?: number;
+  due_math?: number;
 }
 
 export interface Job {
@@ -143,6 +147,8 @@ export interface Concept {
   due: string;
   leech: boolean;
   question_count: number;
+  code_count?: number;
+  math_count?: number;
 }
 
 export interface Source {
@@ -159,6 +165,8 @@ export interface SearchHit {
   ref_id: number;
   title: string;
   snippet: string;
+  via?: string;
+  score?: number | null;
 }
 
 export interface Stats {
@@ -181,6 +189,9 @@ export interface Settings {
   provider: string;
   providers: string[];
   claude_model: string;
+  cursor_model?: string;
+  cursor_models?: Array<{ id: string; label: string }>;
+  cursor_key_configured?: boolean;
   db_path: string;
   timeout_seconds: number;
 }
@@ -197,6 +208,61 @@ export interface ReviewPayload {
   graded_by?: string;
   critique?: string;
   misconception?: string;
+}
+
+export interface CodeProblem {
+  id: number;
+  slug: string;
+  title: string;
+  prompt: string;
+  starter: string;
+  difficulty: string;
+  tags: string[];
+  concept_id: number | null;
+  concept_title: string | null;
+  timeout_seconds: number;
+  attempts: number;
+  ever_passed: boolean;
+  last_passed: boolean | null;
+  last_code: string | null;
+}
+
+export interface CodeRunResult {
+  passed: boolean;
+  checks: Array<{ name: string; ok: boolean; error: string }>;
+  stdout: string;
+  stderr: string;
+  runtime_ms: number;
+  timed_out: boolean;
+  error: string;
+}
+
+export interface MathFormula {
+  id: number;
+  slug: string;
+  title: string;
+  latex: string;
+  intuition: string;
+  tags: string[];
+  concept_id: number | null;
+  concept_title: string | null;
+  blanks: Array<{ id: string; prompt: string }>;
+  terms: Array<{ symbol: string; name: string }>;
+  attempts: number;
+  ever_passed: boolean;
+}
+
+export interface MathGrade {
+  passed: boolean;
+  verdict: string;
+  score: number;
+  hits: string[];
+  missing: string[];
+  spoken: string;
+  intuition: string;
+  blank_results: Array<{ id?: string; ok?: boolean; answer?: string; why?: string }>;
+  term_why: string;
+  fix: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +282,11 @@ export const api = {
     request<{ items: Question[]; total: number }>(`/api/session/drill?size=${size}`, {
       method: "POST",
     }),
+  focus: (query: string, size = 10) =>
+    request<{ items: Question[]; total: number }>(
+      `/api/session/focus?q=${encodeURIComponent(query)}&size=${size}`,
+      { method: "POST" },
+    ),
   reveal: (questionId: number) => request<Reveal>(`/api/questions/${questionId}/reveal`),
   grade: (questionId: number, answer: string, confidence: number) =>
     request<Grade>("/api/grade", {
@@ -231,6 +302,10 @@ export const api = {
   concepts: () => request<Concept[]>("/api/concepts"),
   sources: () => request<Source[]>("/api/sources"),
   search: (q: string) => request<SearchHit[]>(`/api/search?q=${encodeURIComponent(q)}`),
+  generateFromSource: (sourceId: number) =>
+    request<Job>(`/api/sources/${sourceId}/generate`, { method: "POST" }),
+  generateFromFocus: (query: string) =>
+    request<Job>(`/api/focus/generate?q=${encodeURIComponent(query)}`, { method: "POST" }),
 
   coachingReports: () => request<CoachingReport[]>("/api/coaching"),
   requestCoaching: () => request<Job>("/api/coaching", { method: "POST" }),
@@ -257,6 +332,48 @@ export const api = {
       throw new ApiError(await response.text(), response.status);
     }
     return response.json();
+  },
+
+  codeProblems: (conceptId?: number) =>
+    request<CodeProblem[]>(
+      conceptId
+        ? `/api/code/problems?concept_id=${conceptId}`
+        : "/api/code/problems",
+    ),
+  codeProblem: (id: number) => request<CodeProblem>(`/api/code/problems/${id}`),
+  runCode: (problemId: number, code: string) =>
+    request<CodeRunResult>("/api/code/run", {
+      method: "POST",
+      body: JSON.stringify({ problem_id: problemId, code }),
+    }),
+
+  mathFormulas: (conceptId?: number) =>
+    request<MathFormula[]>(
+      conceptId
+        ? `/api/math/formulas?concept_id=${conceptId}`
+        : "/api/math/formulas",
+    ),
+  mathFormula: (id: number) => request<MathFormula>(`/api/math/formulas/${id}`),
+  gradeMath: (body: {
+    formula_id: number;
+    mode: "speak" | "fill" | "why";
+    spoken?: string;
+    blanks?: Record<string, string>;
+    term_symbol?: string;
+    why?: string;
+  }) =>
+    request<MathGrade>("/api/math/grade", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  generateMath: (opts: { conceptId?: number; query?: string }) => {
+    const params = new URLSearchParams();
+    if (opts.conceptId) params.set("concept_id", String(opts.conceptId));
+    if (opts.query) params.set("q", opts.query);
+    const query = params.toString();
+    return request<Job>(`/api/math/generate${query ? `?${query}` : ""}`, {
+      method: "POST",
+    });
   },
 };
 

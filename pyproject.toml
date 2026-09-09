@@ -26,6 +26,8 @@ desktop = ["pywebview>=5.0"]
 semantic = ["sentence-transformers>=3.0"]
 # EPUB ingestion.
 epub = ["EbookLib>=0.18"]
+# Cursor models (Grok, Composer) via the Cursor SDK. Needs CURSOR_API_KEY.
+cursor = ["cursor-sdk"]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]

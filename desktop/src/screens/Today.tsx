@@ -11,13 +11,22 @@ export function Today({
   onStart,
   onDrill,
   onIngest,
+  onFocus,
+  onGenerateFocus,
+  onCode,
+  onMath,
 }: {
   onStart: () => void;
   onDrill: () => void;
   onIngest: () => void;
+  onFocus: (query: string) => void;
+  onGenerateFocus: (query: string) => void;
+  onCode: () => void;
+  onMath: () => void;
 }) {
   const [data, setData] = useState<TodayData | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
+  const [focus, setFocus] = useState("");
 
   useEffect(() => {
     api.today().then(setData).catch(() => undefined);
@@ -76,18 +85,28 @@ export function Today({
           <>
             <h2 className="text-xl font-semibold">Nothing is due</h2>
             <p className="mt-2 max-w-prose text-dim">
-              Your schedule is clear. You can still practise your weakest{" "}
+              Your schedule is clear. You can still practice your weakest{" "}
               {data.concepts} concepts — practice counts toward mastery without
               pulling the review schedule forward.
             </p>
-            <div className="mt-6 flex gap-3">
+            <div className="mt-6 flex flex-wrap gap-3">
               <Button variant="primary" size="lg" onClick={onStart}>
-                Practise 10 questions
+                Practice 10 questions
               </Button>
               {data.open_misconceptions > 0 && (
                 <Button size="lg" onClick={onDrill}>
                   Drill {data.open_misconceptions} misconception
                   {data.open_misconceptions === 1 ? "" : "s"}
+                </Button>
+              )}
+              {(data.code_problems ?? 0) > 0 && (
+                <Button size="lg" onClick={onCode}>
+                  Open the code gym
+                </Button>
+              )}
+              {(data.math_formulas ?? 0) > 0 && (
+                <Button size="lg" onClick={onMath}>
+                  Open the math gym
                 </Button>
               )}
             </div>
@@ -114,13 +133,64 @@ export function Today({
                   {data.open_misconceptions === 1 ? "" : "s"}
                 </Button>
               )}
+              {(data.code_problems ?? 0) > 0 && (
+                <Button size="lg" onClick={onCode}>
+                  {(data.due_code ?? 0) > 0
+                    ? `Code ${data.due_code} linked drill${data.due_code === 1 ? "" : "s"}`
+                    : "Open the code gym"}
+                </Button>
+              )}
+              {(data.math_formulas ?? 0) > 0 && (
+                <Button size="lg" onClick={onMath}>
+                  {(data.due_math ?? 0) > 0
+                    ? `Math ${data.due_math} linked formula${data.due_math === 1 ? "" : "s"}`
+                    : "Open the math gym"}
+                </Button>
+              )}
               <span className="text-xs text-faint">
-                <Kbd>S</Kbd> to start
+                <Kbd>S</Kbd> to start · <Kbd>C</Kbd> for code · <Kbd>M</Kbd> for math
               </span>
             </div>
           </>
         )}
       </Card>
+
+      {!empty && (
+        <Card className="mt-4">
+          <h2 className="text-sm font-medium text-dim">Or work on something specific</h2>
+          <p className="mt-1 text-xs text-faint">
+            Describe it in your own words. Ultralearn finds the closest concepts
+            and passages across every source you have ingested.
+          </p>
+          <input
+            value={focus}
+            onChange={(event) => setFocus(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && focus.trim()) onFocus(focus.trim());
+            }}
+            placeholder="sensor fusion failure modes, pot odds vs implied odds…"
+            className="mt-3 h-11 w-full rounded-lg border border-border bg-raised px-4 text-[15px] text-text placeholder:text-faint focus:border-accent focus:outline-none"
+          />
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button
+              variant="primary"
+              disabled={!focus.trim()}
+              onClick={() => onFocus(focus.trim())}
+            >
+              Practice this
+            </Button>
+            <Button
+              disabled={!focus.trim()}
+              onClick={() => {
+                onGenerateFocus(focus.trim());
+                setFocus("");
+              }}
+            >
+              Write 10 new questions
+            </Button>
+          </div>
+        </Card>
+      )}
 
       <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
         <Stat label="Concepts" value={data.concepts} />
